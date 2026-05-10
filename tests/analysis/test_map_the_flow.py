@@ -8,6 +8,7 @@ from lerobot.analysis.map_the_flow import (
     apply_attention_knockout_mask,
     parse_layer_ranges,
     parse_route_rule,
+    parse_route_rules,
 )
 
 
@@ -28,6 +29,14 @@ def test_parse_route_rule_with_view_alias():
     assert rule.source == "view0"
     assert rule.target == "view1"
     assert rule.layer_ranges == ((1, 5),)
+
+
+def test_parse_bidirectional_route_rules():
+    rules = parse_route_rules("camera_0<->view-1@1-5")
+    assert [(rule.source, rule.target, rule.layer_ranges) for rule in rules] == [
+        ("view0", "view1", ((1, 5),)),
+        ("view1", "view0", ((1, 5),)),
+    ]
 
 
 def test_block_route_masks_target_queries_to_source_keys():

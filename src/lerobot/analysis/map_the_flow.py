@@ -171,6 +171,31 @@ def parse_route_rule(value: str, default_layer_ranges: tuple[LayerRange, ...] | 
     )
 
 
+def parse_route_rules(
+    value: str, default_layer_ranges: tuple[LayerRange, ...] | None = None
+) -> tuple[FlowRouteRule, ...]:
+    """Parse one route condition, expanding ``a<->b`` into both directions."""
+
+    route, _, layer_part = value.partition("@")
+    if not layer_part and ":" in route:
+        route, layer_part = route.split(":", 1)
+    if "<->" not in route:
+        return (parse_route_rule(value, default_layer_ranges=default_layer_ranges),)
+
+    source, target = route.split("<->", 1)
+    if not source.strip() or not target.strip():
+        raise ValueError(f"Invalid bidirectional route '{value}'. Expected format 'source<->target'.")
+    layer_ranges = parse_layer_ranges(layer_part) if layer_part else default_layer_ranges
+    if not layer_ranges:
+        raise ValueError(f"Route '{value}' does not specify layer ranges.")
+    source = _canonical_group(source)
+    target = _canonical_group(target)
+    return (
+        FlowRouteRule(source=source, target=target, layer_ranges=layer_ranges),
+        FlowRouteRule(source=target, target=source, layer_ranges=layer_ranges),
+    )
+
+
 def _blocked_value(mask: Tensor) -> bool | float:
     if mask.dtype == torch.bool:
         return False

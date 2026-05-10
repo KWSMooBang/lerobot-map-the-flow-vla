@@ -25,7 +25,7 @@ lerobot-map-the-flow \
     --env.task_ids='[0]' \
     --eval.n_episodes=5 \
     --eval.batch_size=1 \
-    --analysis.routes='[view0->view1,view1->view0,vision->language,language->action,vision->action]' \
+    --analysis.routes='[view0<->view1,vision->language,language->action,vision->action]' \
     --analysis.layer_centers='[1,2,3,4,5]' \
     --analysis.window_size=5
 ```
@@ -38,7 +38,7 @@ lerobot-map-the-flow \
     --env.type=libero \
     --env.task=libero_goal \
     --analysis.mode=keep_only \
-    --analysis.pathways='[view0->view1@1-10,view1->view0@1-10,language->action@11-18]'
+    --analysis.pathways='[view0<->view1@1-10,language->action@11-18]'
 ```
 """
 
@@ -56,7 +56,7 @@ import torch
 from termcolor import colored
 
 from lerobot import envs, policies  # noqa: F401
-from lerobot.analysis.map_the_flow import AttentionKnockoutSpec, parse_layer_ranges, parse_route_rule
+from lerobot.analysis.map_the_flow import AttentionKnockoutSpec, parse_layer_ranges, parse_route_rules
 from lerobot.configs import parser
 from lerobot.configs.default import EvalConfig
 from lerobot.configs.policies import PreTrainedConfig
@@ -76,8 +76,7 @@ class MapTheFlowAnalysisConfig:
     # Routes are evaluated as the Cartesian product of routes x layer_ranges in block mode.
     routes: list[str] = field(
         default_factory=lambda: [
-            "view0->view1",
-            "view1->view0",
+            "view0<->view1",
             "vision->language",
             "language->action",
             "vision->action",
@@ -149,7 +148,7 @@ def _make_specs(analysis_cfg: MapTheFlowAnalysisConfig) -> list[AttentionKnockou
     if analysis_cfg.mode == "keep_only":
         if not analysis_cfg.pathways:
             raise ValueError("--analysis.mode=keep_only requires --analysis.pathways='[route@layers,...]'")
-        rules = tuple(parse_route_rule(pathway) for pathway in analysis_cfg.pathways)
+        rules = tuple(rule for pathway in analysis_cfg.pathways for rule in parse_route_rules(pathway))
         return [
             AttentionKnockoutSpec(
                 rules=rules,
@@ -159,7 +158,7 @@ def _make_specs(analysis_cfg: MapTheFlowAnalysisConfig) -> list[AttentionKnockou
         ]
 
     if analysis_cfg.pathways:
-        rules = tuple(parse_route_rule(pathway) for pathway in analysis_cfg.pathways)
+        rules = tuple(rule for pathway in analysis_cfg.pathways for rule in parse_route_rules(pathway))
         return [
             AttentionKnockoutSpec(
                 rules=rules,
@@ -197,12 +196,13 @@ def _make_specs(analysis_cfg: MapTheFlowAnalysisConfig) -> list[AttentionKnockou
 
     for parsed_range, range_name in layer_windows:
         for route in analysis_cfg.routes:
-            rule = parse_route_rule(route, default_layer_ranges=parsed_range)
+            rules = parse_route_rules(route, default_layer_ranges=parsed_range)
+            route_name = route.replace("<->", "_bidir_").replace("->", "_to_")
             specs.append(
                 AttentionKnockoutSpec(
-                    rules=(rule,),
+                    rules=rules,
                     mode="block",
-                    name=f"{rule.source}_to_{rule.target}_{range_name}",
+                    name=f"{route_name}_{range_name}",
                 )
             )
     if analysis_cfg.max_conditions is not None:

@@ -7,6 +7,7 @@ from .map_the_flow import (
     attention_knockout_suffix_context,
     parse_layer_ranges,
     parse_route_rule,
+    parse_route_rules,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "attention_knockout_suffix_context",
     "parse_layer_ranges",
     "parse_route_rule",
+    "parse_route_rules",
 ]
