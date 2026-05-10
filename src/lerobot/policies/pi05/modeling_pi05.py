@@ -26,6 +26,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.analysis.map_the_flow import (
+    AttentionKnockoutSpec,
+    attention_knockout_prefix_context,
+    attention_knockout_suffix_context,
+)
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 # Conditional import for type checking and lazy loading
@@ -63,6 +68,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    attention_knockout: AttentionKnockoutSpec | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -789,6 +795,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
+        attention_knockout: AttentionKnockoutSpec | None = kwargs.get("attention_knockout")
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
@@ -805,19 +812,27 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_vision_tokens = prefix_embs.shape[1] - tokens.shape[1]
+        prefix_language_tokens = tokens.shape[1]
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        with attention_knockout_prefix_context(
+            self.paligemma_with_expert.paligemma.model.language_model,
+            spec=attention_knockout,
+            vision_tokens=prefix_vision_tokens,
+            language_tokens=prefix_language_tokens,
+        ):
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         dt = -1.0 / num_steps
 
@@ -832,6 +847,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
+                    attention_knockout=attention_knockout,
+                    prefix_vision_tokens=prefix_vision_tokens,
+                    prefix_language_tokens=prefix_language_tokens,
                 )
 
             if self._rtc_enabled():
@@ -863,6 +881,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        prefix_vision_tokens: int | None = None,
+        prefix_language_tokens: int | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
@@ -882,14 +903,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         past_key_values = copy.deepcopy(past_key_values)
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        if prefix_vision_tokens is None or prefix_language_tokens is None:
+            prefix_vision_tokens = prefix_len
+            prefix_language_tokens = 0
+        with attention_knockout_suffix_context(
+            self.paligemma_with_expert.gemma_expert.model,
+            spec=attention_knockout,
+            vision_tokens=prefix_vision_tokens,
+            language_tokens=prefix_language_tokens,
+            state_tokens=0,
+            action_tokens=self.config.chunk_size,
+        ):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -926,6 +958,7 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+        self._attention_knockout: AttentionKnockoutSpec | None = None
 
         self.reset()
 
@@ -1119,6 +1152,11 @@ class PI05Policy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
+    def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
+        """Set an inference-only attention intervention used by Map the Flow experiments."""
+        self._attention_knockout = attention_knockout
+        self.reset()
+
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
         self.rtc_processor = None
@@ -1217,7 +1255,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            kwargs = {}
+            if self._attention_knockout is not None:
+                kwargs["attention_knockout"] = self._attention_knockout
+            actions = self.predict_action_chunk(batch, **kwargs)[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
