@@ -25,7 +25,7 @@ lerobot-map-the-flow \
     --env.task_ids='[0]' \
     --eval.n_episodes=5 \
     --eval.batch_size=1 \
-    --analysis.routes='[vision->vision,vision->language,language->action,vision->action,action->action]' \
+    --analysis.routes='[view0->view1,view1->view0,vision->language,language->action,vision->action]' \
     --analysis.layer_ranges='[1-5,6-10,11-15,16-18]'
 ```
 
@@ -37,7 +37,7 @@ lerobot-map-the-flow \
     --env.type=libero \
     --env.task=libero_goal \
     --analysis.mode=keep_only \
-    --analysis.pathways='[vision->vision@1-10,vision->language@6-15,language->action@11-18]'
+    --analysis.pathways='[view0->view1@1-10,view1->view0@1-10,language->action@11-18]'
 ```
 """
 
@@ -75,7 +75,8 @@ class MapTheFlowAnalysisConfig:
     # Routes are evaluated as the Cartesian product of routes x layer_ranges in block mode.
     routes: list[str] = field(
         default_factory=lambda: [
-            "vision->vision",
+            "view0->view1",
+            "view1->view0",
             "vision->language",
             "language->action",
             "vision->action",

@@ -23,6 +23,13 @@ def test_parse_route_rule_with_alias_and_range():
     assert rule.layer_ranges == ((6, 20),)
 
 
+def test_parse_route_rule_with_view_alias():
+    rule = parse_route_rule("camera_0->view-1@1-5")
+    assert rule.source == "view0"
+    assert rule.target == "view1"
+    assert rule.layer_ranges == ((1, 5),)
+
+
 def test_block_route_masks_target_queries_to_source_keys():
     mask = torch.zeros(1, 1, 4, 4)
     spec = AttentionKnockoutSpec(
@@ -61,3 +68,30 @@ def test_keep_only_preserves_allowed_route_and_blocks_others():
     )
     assert torch.all(out[..., 0:3, 2:4] == 0)
     assert torch.all(out[..., 0:3, 0:2] < -1e20)
+
+
+def test_cross_view_route_masks_only_other_view():
+    mask = torch.zeros(1, 1, 4, 4)
+    spec = AttentionKnockoutSpec(
+        rules=(FlowRouteRule("view0", "view1", ((1, 1),)),),
+        mode="block",
+    )
+    out = apply_attention_knockout_mask(
+        mask,
+        layer_index=0,
+        spec=spec,
+        source_spans={
+            "vision": [(0, 4)],
+            "view0": [(0, 2)],
+            "view1": [(2, 4)],
+        },
+        target_spans={
+            "vision": [(0, 4)],
+            "view0": [(0, 2)],
+            "view1": [(2, 4)],
+        },
+    )
+    assert torch.all(out[..., 2:4, 0:2] < -1e20)
+    assert torch.all(out[..., 0:2, 2:4] == 0)
+    assert torch.all(out[..., 0:2, 0:2] == 0)
+    assert torch.all(out[..., 2:4, 2:4] == 0)

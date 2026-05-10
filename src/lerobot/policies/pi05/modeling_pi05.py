@@ -814,6 +814,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_vision_tokens = prefix_embs.shape[1] - tokens.shape[1]
         prefix_language_tokens = tokens.shape[1]
+        prefix_vision_view_tokens = None
+        if len(images) > 0 and prefix_vision_tokens % len(images) == 0:
+            prefix_vision_view_tokens = [prefix_vision_tokens // len(images)] * len(images)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -825,6 +828,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             spec=attention_knockout,
             vision_tokens=prefix_vision_tokens,
             language_tokens=prefix_language_tokens,
+            vision_view_tokens=prefix_vision_view_tokens,
         ):
             _, past_key_values = self.paligemma_with_expert.forward(
                 attention_mask=prefix_att_2d_masks_4d,
@@ -850,6 +854,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     attention_knockout=attention_knockout,
                     prefix_vision_tokens=prefix_vision_tokens,
                     prefix_language_tokens=prefix_language_tokens,
+                    prefix_vision_view_tokens=prefix_vision_view_tokens,
                 )
 
             if self._rtc_enabled():
@@ -884,6 +889,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         attention_knockout: AttentionKnockoutSpec | None = None,
         prefix_vision_tokens: int | None = None,
         prefix_language_tokens: int | None = None,
+        prefix_vision_view_tokens: list[int] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
@@ -913,6 +919,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             language_tokens=prefix_language_tokens,
             state_tokens=0,
             action_tokens=self.config.chunk_size,
+            vision_view_tokens=prefix_vision_view_tokens,
         ):
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=full_att_2d_masks_4d,

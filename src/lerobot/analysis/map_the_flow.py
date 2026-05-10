@@ -114,6 +114,12 @@ class AttentionKnockoutSpec:
 
 def _canonical_group(name: str) -> str:
     normalized = name.strip().lower().replace("-", "_")
+    for prefix in ("view", "camera", "cam"):
+        compact_prefix = f"{prefix}_"
+        if normalized.startswith(compact_prefix) and normalized[len(compact_prefix) :].isdigit():
+            return f"view{normalized[len(compact_prefix) :]}"
+        if normalized.startswith(prefix) and normalized[len(prefix) :].isdigit():
+            return f"view{normalized[len(prefix) :]}"
     return GROUP_ALIASES.get(normalized, normalized)
 
 
@@ -241,11 +247,18 @@ def apply_attention_knockout_mask(
         return updated
 
     allowed = {(rule.source, rule.target) for rule in active_rules}
-    # Aggregate aliases such as "prefix" and "suffix" are useful for explicit block rules,
-    # but using them while constructing the keep-only complement would overwrite allowed
-    # primitive routes because their spans overlap with vision/language/action/state.
-    source_names = sorted(name for name in source_spans if name not in {"prefix", "suffix"})
-    target_names = sorted(name for name in target_spans if name not in {"prefix", "suffix"})
+    # Aggregate aliases such as "prefix", "suffix", and "vision" are useful for
+    # explicit block rules, but using them while constructing the keep-only
+    # complement would overwrite allowed primitive routes because their spans
+    # overlap with view/language/action/state groups.
+    source_aggregates = {"prefix", "suffix"}
+    target_aggregates = {"prefix", "suffix"}
+    if any(name.startswith("view") for name in source_spans):
+        source_aggregates.add("vision")
+    if any(name.startswith("view") for name in target_spans):
+        target_aggregates.add("vision")
+    source_names = sorted(name for name in source_spans if name not in source_aggregates)
+    target_names = sorted(name for name in target_spans if name not in target_aggregates)
     for target_name in target_names:
         for source_name in source_names:
             if (source_name, target_name) in allowed:
@@ -361,6 +374,7 @@ def attention_knockout_prefix_context(
     spec: AttentionKnockoutSpec | None,
     vision_tokens: int,
     language_tokens: int,
+    vision_view_tokens: list[int] | tuple[int, ...] | None = None,
 ) -> Iterator[None]:
     """Patch prefix self-attention over vision and language tokens."""
 
@@ -370,6 +384,11 @@ def attention_knockout_prefix_context(
         "language": [(vision_tokens, prefix_tokens)],
         "prefix": [(0, prefix_tokens)],
     }
+    if vision_view_tokens is not None:
+        offset = 0
+        for view_idx, view_tokens in enumerate(vision_view_tokens):
+            source_spans[f"view{view_idx}"] = [(offset, offset + view_tokens)]
+            offset += view_tokens
     target_spans = dict(source_spans)
     return _patched_attention_layers(
         transformer,
@@ -389,6 +408,7 @@ def attention_knockout_suffix_context(
     language_tokens: int,
     state_tokens: int,
     action_tokens: int,
+    vision_view_tokens: list[int] | tuple[int, ...] | None = None,
 ) -> Iterator[None]:
     """Patch suffix attention from prefix/state/action sources into suffix targets."""
 
@@ -402,6 +422,11 @@ def attention_knockout_suffix_context(
         "suffix": [(prefix_tokens, key_tokens)],
         "action": [(prefix_tokens + state_tokens, key_tokens)],
     }
+    if vision_view_tokens is not None:
+        offset = 0
+        for view_idx, view_tokens in enumerate(vision_view_tokens):
+            source_spans[f"view{view_idx}"] = [(offset, offset + view_tokens)]
+            offset += view_tokens
     target_spans = {
         "suffix": [(0, suffix_tokens)],
         "action": [(state_tokens, suffix_tokens)],
