@@ -26,7 +26,8 @@ lerobot-map-the-flow \
     --eval.n_episodes=5 \
     --eval.batch_size=1 \
     --analysis.routes='[view0->view1,view1->view0,vision->language,language->action,vision->action]' \
-    --analysis.layer_ranges='[1-5,6-10,11-15,16-18]'
+    --analysis.layer_centers='[1,2,3,4,5]' \
+    --analysis.window_size=5
 ```
 
 For a sparse-pathway sufficiency run:
@@ -84,7 +85,13 @@ class MapTheFlowAnalysisConfig:
             "action->action",
         ]
     )
-    layer_ranges: list[str] = field(default_factory=lambda: ["1-5", "6-10", "11-15", "16-18"])
+    # Main Map the Flow protocol: sweep a center layer l and block a window of k layers around it.
+    # pi0/pi0.5 have 18-layer VLM and action-expert stacks, so k=5 is a conservative default.
+    layer_centers: list[int] | None = None
+    window_size: int = 5
+    max_layer: int = 18
+    # Optional explicit ranges such as ["1-5", "6-10"]. If set, this overrides centered windows.
+    layer_ranges: list[str] = field(default_factory=list)
     # A list of route@layer-range rules used as a single condition. In keep_only mode,
     # these rules are the hypothesized effective pathway retained during evaluation.
     pathways: list[str] = field(default_factory=list)
@@ -162,9 +169,33 @@ def _make_specs(analysis_cfg: MapTheFlowAnalysisConfig) -> list[AttentionKnockou
         ]
 
     specs = []
-    for layer_range in analysis_cfg.layer_ranges:
-        parsed_range = parse_layer_ranges(layer_range)
-        range_name = "_".join(f"L{start}-{end}" for start, end in parsed_range)
+    if analysis_cfg.layer_ranges:
+        layer_windows = [
+            (
+                parse_layer_ranges(layer_range),
+                "_".join(f"L{start}-{end}" for start, end in parse_layer_ranges(layer_range)),
+            )
+            for layer_range in analysis_cfg.layer_ranges
+        ]
+    else:
+        if analysis_cfg.window_size < 1:
+            raise ValueError("--analysis.window_size must be >= 1")
+        if analysis_cfg.max_layer < 1:
+            raise ValueError("--analysis.max_layer must be >= 1")
+        half_window = analysis_cfg.window_size // 2
+        centers = analysis_cfg.layer_centers or list(range(1, analysis_cfg.max_layer + 1))
+        layer_windows = []
+        for center in centers:
+            if center < 1 or center > analysis_cfg.max_layer:
+                raise ValueError(
+                    f"Layer center {center} is outside [1, {analysis_cfg.max_layer}]. "
+                    "Set --analysis.max_layer if your model has a different depth."
+                )
+            start = max(1, center - half_window)
+            end = min(analysis_cfg.max_layer, center + half_window)
+            layer_windows.append((((start, end),), f"center_L{center}_window_L{start}-{end}"))
+
+    for parsed_range, range_name in layer_windows:
         for route in analysis_cfg.routes:
             rule = parse_route_rule(route, default_layer_ranges=parsed_range)
             specs.append(
