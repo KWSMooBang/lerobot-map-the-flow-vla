@@ -41,8 +41,6 @@ lerobot-map-the-flow \
 ```
 """
 
-from __future__ import annotations
-
 import datetime as dt
 import json
 import logging
