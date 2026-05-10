@@ -287,6 +287,33 @@ def _summarize_delta(result: dict, baseline: dict | None) -> dict:
     return summary
 
 
+def _build_payload(
+    cfg: MapTheFlowPipelineConfig,
+    results: list[dict],
+    baseline_result: dict | None,
+    *,
+    completed: bool,
+) -> dict:
+    return {
+        "completed": completed,
+        "config": asdict(cfg),
+        "results": results,
+        "summary": [
+            _summarize_delta(result, baseline_result if result["condition"] != "baseline" else None)
+            for result in results
+        ],
+    }
+
+
+def _save_payload(output_dir: Path, payload: dict) -> Path:
+    output_path = output_dir / "map_the_flow_info.json"
+    tmp_path = output_dir / "map_the_flow_info.json.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+    tmp_path.replace(output_path)
+    return output_path
+
+
 @parser.wrap()
 def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
     logging.info(pformat(asdict(cfg)))
@@ -348,17 +375,12 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
             summary = _summarize_delta(result, baseline_result if spec is not None else None)
             print(json.dumps(summary, indent=2))
 
-    payload = {
-        "config": asdict(cfg),
-        "results": results,
-        "summary": [
-            _summarize_delta(result, baseline_result if result["condition"] != "baseline" else None)
-            for result in results
-        ],
-    }
-    output_path = output_dir / "map_the_flow_info.json"
-    with open(output_path, "w") as f:
-        json.dump(payload, f, indent=2, default=str)
+            payload = _build_payload(cfg, results, baseline_result, completed=False)
+            output_path = _save_payload(output_dir, payload)
+            logging.info("Saved partial Map the Flow results to %s", output_path)
+
+    payload = _build_payload(cfg, results, baseline_result, completed=True)
+    output_path = _save_payload(output_dir, payload)
     logging.info("Saved Map the Flow analysis to %s", output_path)
 
 
