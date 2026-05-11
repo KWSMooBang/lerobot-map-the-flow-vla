@@ -104,3 +104,44 @@ def test_cross_view_route_masks_only_other_view():
     assert torch.all(out[..., 0:2, 2:4] == 0)
     assert torch.all(out[..., 0:2, 0:2] == 0)
     assert torch.all(out[..., 2:4, 2:4] == 0)
+
+
+def test_block_route_supports_token_mask_groups():
+    mask = torch.zeros(1, 1, 3, 8)
+    spec = AttentionKnockoutSpec(
+        rules=(FlowRouteRule("state_text", "action", ((1, 1),)),),
+        mode="block",
+    )
+    state_text_mask = torch.tensor([[False, False, False, True, True, False, False, False]])
+    out = apply_attention_knockout_mask(
+        mask,
+        layer_index=0,
+        spec=spec,
+        source_spans={"language": [(0, 6)], "action": [(6, 8)]},
+        target_spans={"action": [(0, 3)]},
+        source_token_masks={"state_text": state_text_mask},
+    )
+    assert torch.all(out[..., 0:3, 3:5] < -1e20)
+    assert torch.all(out[..., 0:3, 0:3] == 0)
+    assert torch.all(out[..., 0:3, 5:8] == 0)
+
+
+def test_keep_only_aggregate_language_allows_instruction_state_children():
+    mask = torch.zeros(1, 1, 3, 8)
+    spec = AttentionKnockoutSpec(
+        rules=(FlowRouteRule("language", "action", ((1, 1),)),),
+        mode="keep_only",
+    )
+    instruction_mask = torch.tensor([[False, True, True, False, False, False, False, False]])
+    state_text_mask = torch.tensor([[False, False, False, True, True, False, False, False]])
+    out = apply_attention_knockout_mask(
+        mask,
+        layer_index=0,
+        spec=spec,
+        source_spans={"vision": [(0, 1)], "language": [(1, 6)], "action": [(6, 8)]},
+        target_spans={"action": [(0, 3)]},
+        source_token_masks={"instruction": instruction_mask, "state_text": state_text_mask},
+    )
+    assert torch.all(out[..., 0:3, 1:5] == 0)
+    assert torch.all(out[..., 0:3, 0:1] < -1e20)
+    assert torch.all(out[..., 2:3, 6:8] < -1e20)

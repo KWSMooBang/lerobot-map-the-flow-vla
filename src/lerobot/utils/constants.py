@@ -26,6 +26,9 @@ OBS_IMAGES = OBS_IMAGE + "s"
 OBS_LANGUAGE = OBS_STR + ".language"
 OBS_LANGUAGE_TOKENS = OBS_LANGUAGE + ".tokens"
 OBS_LANGUAGE_ATTENTION_MASK = OBS_LANGUAGE + ".attention_mask"
+OBS_LANGUAGE_INSTRUCTION_MASK = OBS_LANGUAGE + ".instruction_mask"
+OBS_LANGUAGE_STATE_MASK = OBS_LANGUAGE + ".state_mask"
+OBS_LANGUAGE_SCAFFOLD_MASK = OBS_LANGUAGE + ".scaffold_mask"
 OBS_LANGUAGE_SUBTASK = OBS_STR + ".subtask"
 OBS_LANGUAGE_SUBTASK_TOKENS = OBS_LANGUAGE_SUBTASK + ".tokens"
 OBS_LANGUAGE_SUBTASK_ATTENTION_MASK = OBS_LANGUAGE_SUBTASK + ".attention_mask"
@@ -77,6 +80,7 @@ LOOKAHEAD_BACKTRACKTABLE = 100
 
 # openpi
 OPENPI_ATTENTION_MASK_VALUE = -2.3819763e38  # TODO(pepijn): Modify this when extending support to fp8 models
+PI05_LANGUAGE_CHAR_SPANS = "pi05_language_char_spans"
 
 # Constants for LIBERO observation keys
 LIBERO_KEY_EEF_POS = "robot_state/eef/pos"

@@ -44,6 +44,10 @@ from torch import Tensor, nn
 LayerRange = tuple[int, int]
 Span = tuple[int, int]
 SpanMap = dict[str, list[Span]]
+TokenMaskMap = dict[str, Tensor]
+
+LANGUAGE_CHILD_GROUPS = {"instruction", "state_text", "scaffold"}
+SUFFIX_CHILD_GROUPS = {"state", "action"}
 
 GROUP_ALIASES = {
     "image": "vision",
@@ -52,7 +56,14 @@ GROUP_ALIASES = {
     "video": "vision",
     "text": "language",
     "lang": "language",
-    "instruction": "language",
+    "instr": "instruction",
+    "task": "instruction",
+    "state_tokens": "state_text",
+    "state_token": "state_text",
+    "language_state": "state_text",
+    "text_state": "state_text",
+    "proprio_text": "state_text",
+    "prompt_scaffold": "scaffold",
     "proprio": "state",
     "proprioception": "state",
     "actions": "action",
@@ -211,6 +222,61 @@ def _spans_for(name: str, spans: SpanMap) -> list[Span]:
     return spans.get(canonical, [])
 
 
+def _token_mask_for(name: str, token_masks: TokenMaskMap | None) -> Tensor | None:
+    if not token_masks:
+        return None
+    canonical = _canonical_group(name)
+    return token_masks.get(canonical)
+
+
+def _selector_mask(
+    *,
+    name: str,
+    spans: SpanMap,
+    token_masks: TokenMaskMap | None,
+    length: int,
+    batch_size: int,
+    device: torch.device,
+) -> Tensor | None:
+    selected = torch.zeros(batch_size, length, dtype=torch.bool, device=device)
+    has_selector = False
+    for start, end in _spans_for(name, spans):
+        start = max(0, min(length, start))
+        end = max(start, min(length, end))
+        if end > start:
+            selected[:, start:end] = True
+            has_selector = True
+
+    token_mask = _token_mask_for(name, token_masks)
+    if token_mask is not None:
+        token_mask = token_mask.to(device=device, dtype=torch.bool)
+        if token_mask.ndim == 1:
+            token_mask = token_mask.unsqueeze(0)
+        if token_mask.shape[0] == 1 and batch_size > 1:
+            token_mask = token_mask.expand(batch_size, -1)
+        if token_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"Token mask for group '{name}' has batch size {token_mask.shape[0]}, expected {batch_size}."
+            )
+        usable = min(length, token_mask.shape[1])
+        if usable > 0:
+            selected[:, :usable] |= token_mask[:, :usable]
+            has_selector = True
+
+    if not has_selector or not torch.any(selected):
+        return None
+    return selected
+
+
+def _selector_outer_mask(attention_mask: Tensor, target_mask: Tensor, source_mask: Tensor) -> Tensor:
+    batch_size, target_length = target_mask.shape
+    source_length = source_mask.shape[1]
+    extra_dims = attention_mask.ndim - 3
+    target_shape = (batch_size, *([1] * extra_dims), target_length, 1)
+    source_shape = (batch_size, *([1] * extra_dims), 1, source_length)
+    return target_mask.reshape(target_shape) & source_mask.reshape(source_shape)
+
+
 def _restore_matching_diagonal(mask: Tensor, original: Tensor, source: Span, target: Span) -> None:
     source_start, source_end = source
     target_start, target_end = target
@@ -221,24 +287,94 @@ def _restore_matching_diagonal(mask: Tensor, original: Tensor, source: Span, tar
         ]
 
 
+def _restore_token_diagonal(mask: Tensor, original: Tensor, source_mask: Tensor, target_mask: Tensor) -> None:
+    if source_mask.shape[1] != target_mask.shape[1]:
+        return
+    diagonal = source_mask & target_mask
+    for batch_idx in range(diagonal.shape[0]):
+        positions = torch.where(diagonal[batch_idx])[0].tolist()
+        for position in positions:
+            mask[batch_idx, ..., position, position] = original[batch_idx, ..., position, position]
+
+
 def _mask_route(
     mask: Tensor,
     original: Tensor,
-    source_spans: list[Span],
-    target_spans: list[Span],
     *,
+    source_spans: SpanMap,
+    target_spans: SpanMap,
+    source_token_masks: TokenMaskMap | None,
+    target_token_masks: TokenMaskMap | None,
     exclude_self: bool,
     source_name: str,
     target_name: str,
 ) -> None:
     blocked_value = _blocked_value(mask)
-    for target in target_spans:
-        target_start, target_end = target
-        for source in source_spans:
-            source_start, source_end = source
-            mask[..., target_start:target_end, source_start:source_end] = blocked_value
-            if exclude_self and _canonical_group(source_name) == _canonical_group(target_name):
+    batch_size = mask.shape[0]
+    target_length = mask.shape[-2]
+    source_length = mask.shape[-1]
+    source_selector = _selector_mask(
+        name=source_name,
+        spans=source_spans,
+        token_masks=source_token_masks,
+        length=source_length,
+        batch_size=batch_size,
+        device=mask.device,
+    )
+    target_selector = _selector_mask(
+        name=target_name,
+        spans=target_spans,
+        token_masks=target_token_masks,
+        length=target_length,
+        batch_size=batch_size,
+        device=mask.device,
+    )
+    if source_selector is None or target_selector is None:
+        return
+
+    mask.masked_fill_(_selector_outer_mask(mask, target_selector, source_selector), blocked_value)
+    if exclude_self and _canonical_group(source_name) == _canonical_group(target_name):
+        for target in _spans_for(target_name, target_spans):
+            for source in _spans_for(source_name, source_spans):
                 _restore_matching_diagonal(mask, original, source, target)
+        _restore_token_diagonal(mask, original, source_selector, target_selector)
+
+
+def _group_contains(parent: str, child: str) -> bool:
+    parent = _canonical_group(parent)
+    child = _canonical_group(child)
+    if parent == child or parent == "all":
+        return True
+    if parent == "vision" and child.startswith("view"):
+        return True
+    if parent == "language" and child in LANGUAGE_CHILD_GROUPS:
+        return True
+    if parent == "prefix" and (
+        child in {"vision", "language"} or child.startswith("view") or child in LANGUAGE_CHILD_GROUPS
+    ):
+        return True
+    if parent == "suffix" and child in SUFFIX_CHILD_GROUPS:
+        return True
+    return False
+
+
+def _route_allowed(source_name: str, target_name: str, allowed: set[tuple[str, str]]) -> bool:
+    return any(
+        _group_contains(allowed_source, source_name) and _group_contains(allowed_target, target_name)
+        for allowed_source, allowed_target in allowed
+    )
+
+
+def _primitive_group_names(spans: SpanMap, token_masks: TokenMaskMap | None) -> tuple[list[str], list[str]]:
+    names = set(spans)
+    if token_masks:
+        names.update(_canonical_group(name) for name in token_masks)
+    aggregates = {"prefix", "suffix"}
+    if any(name.startswith("view") for name in names):
+        aggregates.add("vision")
+    if any(name in LANGUAGE_CHILD_GROUPS for name in names):
+        aggregates.add("language")
+    return sorted(name for name in names if name not in aggregates), sorted(aggregates)
 
 
 def apply_attention_knockout_mask(
@@ -248,6 +384,8 @@ def apply_attention_knockout_mask(
     spec: AttentionKnockoutSpec,
     source_spans: SpanMap,
     target_spans: SpanMap,
+    source_token_masks: TokenMaskMap | None = None,
+    target_token_masks: TokenMaskMap | None = None,
 ) -> Tensor:
     """Return a copy of ``attention_mask`` with requested routes disabled."""
 
@@ -263,8 +401,10 @@ def apply_attention_knockout_mask(
             _mask_route(
                 updated,
                 original,
-                _spans_for(rule.source, source_spans),
-                _spans_for(rule.target, target_spans),
+                source_spans=source_spans,
+                target_spans=target_spans,
+                source_token_masks=source_token_masks,
+                target_token_masks=target_token_masks,
                 exclude_self=spec.exclude_self,
                 source_name=rule.source,
                 target_name=rule.target,
@@ -272,27 +412,19 @@ def apply_attention_knockout_mask(
         return updated
 
     allowed = {(rule.source, rule.target) for rule in active_rules}
-    # Aggregate aliases such as "prefix", "suffix", and "vision" are useful for
-    # explicit block rules, but using them while constructing the keep-only
-    # complement would overwrite allowed primitive routes because their spans
-    # overlap with view/language/action/state groups.
-    source_aggregates = {"prefix", "suffix"}
-    target_aggregates = {"prefix", "suffix"}
-    if any(name.startswith("view") for name in source_spans):
-        source_aggregates.add("vision")
-    if any(name.startswith("view") for name in target_spans):
-        target_aggregates.add("vision")
-    source_names = sorted(name for name in source_spans if name not in source_aggregates)
-    target_names = sorted(name for name in target_spans if name not in target_aggregates)
+    source_names, _ = _primitive_group_names(source_spans, source_token_masks)
+    target_names, _ = _primitive_group_names(target_spans, target_token_masks)
     for target_name in target_names:
         for source_name in source_names:
-            if (source_name, target_name) in allowed:
+            if _route_allowed(source_name, target_name, allowed):
                 continue
             _mask_route(
                 updated,
                 original,
-                source_spans[source_name],
-                target_spans[target_name],
+                source_spans=source_spans,
+                target_spans=target_spans,
+                source_token_masks=source_token_masks,
+                target_token_masks=target_token_masks,
                 exclude_self=spec.exclude_self,
                 source_name=source_name,
                 target_name=target_name,
@@ -340,6 +472,8 @@ def _patched_attention_layers(
     key_length: int,
     source_spans: SpanMap,
     target_spans: SpanMap,
+    source_token_masks: TokenMaskMap | None = None,
+    target_token_masks: TokenMaskMap | None = None,
 ) -> Iterator[None]:
     if spec is None:
         with nullcontext():
@@ -374,6 +508,8 @@ def _patched_attention_layers(
                         spec=spec,
                         source_spans=source_spans,
                         target_spans=target_spans,
+                        source_token_masks=source_token_masks,
+                        target_token_masks=target_token_masks,
                     )
 
                 patched_args, patched_kwargs = _replace_attention_mask(
@@ -393,6 +529,29 @@ def _patched_attention_layers(
             attention.forward = original_forward
 
 
+def _offset_language_token_masks(
+    language_token_masks: TokenMaskMap | None,
+    *,
+    prefix_tokens: int,
+    vision_tokens: int,
+    language_tokens: int,
+) -> TokenMaskMap | None:
+    if not language_token_masks:
+        return None
+    full_masks: TokenMaskMap = {}
+    for group_name, mask in language_token_masks.items():
+        canonical = _canonical_group(group_name)
+        mask = mask.to(dtype=torch.bool)
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+        full_mask = torch.zeros(mask.shape[0], prefix_tokens, dtype=torch.bool, device=mask.device)
+        usable = min(language_tokens, mask.shape[1])
+        if usable > 0:
+            full_mask[:, vision_tokens : vision_tokens + usable] = mask[:, :usable]
+        full_masks[canonical] = full_mask
+    return full_masks
+
+
 def attention_knockout_prefix_context(
     transformer: nn.Module,
     *,
@@ -400,6 +559,7 @@ def attention_knockout_prefix_context(
     vision_tokens: int,
     language_tokens: int,
     vision_view_tokens: list[int] | tuple[int, ...] | None = None,
+    language_token_masks: TokenMaskMap | None = None,
 ) -> Iterator[None]:
     """Patch prefix self-attention over vision and language tokens."""
 
@@ -415,6 +575,12 @@ def attention_knockout_prefix_context(
             source_spans[f"view{view_idx}"] = [(offset, offset + view_tokens)]
             offset += view_tokens
     target_spans = dict(source_spans)
+    prefix_language_token_masks = _offset_language_token_masks(
+        language_token_masks,
+        prefix_tokens=prefix_tokens,
+        vision_tokens=vision_tokens,
+        language_tokens=language_tokens,
+    )
     return _patched_attention_layers(
         transformer,
         spec=spec,
@@ -422,6 +588,8 @@ def attention_knockout_prefix_context(
         key_length=prefix_tokens,
         source_spans=source_spans,
         target_spans=target_spans,
+        source_token_masks=prefix_language_token_masks,
+        target_token_masks=prefix_language_token_masks,
     )
 
 
@@ -434,6 +602,7 @@ def attention_knockout_suffix_context(
     state_tokens: int,
     action_tokens: int,
     vision_view_tokens: list[int] | tuple[int, ...] | None = None,
+    language_token_masks: TokenMaskMap | None = None,
 ) -> Iterator[None]:
     """Patch suffix attention from prefix/state/action sources into suffix targets."""
 
@@ -460,6 +629,12 @@ def attention_knockout_suffix_context(
         source_spans["state"] = [(prefix_tokens, prefix_tokens + state_tokens)]
         target_spans["state"] = [(0, state_tokens)]
 
+    source_language_token_masks = _offset_language_token_masks(
+        language_token_masks,
+        prefix_tokens=key_tokens,
+        vision_tokens=vision_tokens,
+        language_tokens=language_tokens,
+    )
     return _patched_attention_layers(
         transformer,
         spec=spec,
@@ -467,4 +642,5 @@ def attention_knockout_suffix_context(
         key_length=key_tokens,
         source_spans=source_spans,
         target_spans=target_spans,
+        source_token_masks=source_language_token_masks,
     )

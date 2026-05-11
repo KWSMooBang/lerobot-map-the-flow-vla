@@ -52,6 +52,9 @@ from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_INSTRUCTION_MASK,
+    OBS_LANGUAGE_SCAFFOLD_MASK,
+    OBS_LANGUAGE_STATE_MASK,
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
@@ -62,6 +65,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
     attention_knockout: AttentionKnockoutSpec | None
+    language_token_masks: dict[str, Tensor] | None
 
 
 def _is_paligemma_tied_embedding_key(key: str) -> bool:
@@ -804,6 +808,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             num_steps = self.config.num_inference_steps
 
         attention_knockout: AttentionKnockoutSpec | None = kwargs.get("attention_knockout")
+        language_token_masks: dict[str, Tensor] | None = kwargs.get("language_token_masks")
 
         bsize = tokens.shape[0]
         device = tokens.device
@@ -835,6 +840,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             vision_tokens=prefix_vision_tokens,
             language_tokens=prefix_language_tokens,
             vision_view_tokens=prefix_vision_view_tokens,
+            language_token_masks=language_token_masks,
         ):
             _, past_key_values = self.paligemma_with_expert.forward(
                 attention_mask=prefix_att_2d_masks_4d,
@@ -861,6 +867,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     prefix_vision_tokens=prefix_vision_tokens,
                     prefix_language_tokens=prefix_language_tokens,
                     prefix_vision_view_tokens=prefix_vision_view_tokens,
+                    language_token_masks=language_token_masks,
                 )
 
             if self._rtc_enabled():
@@ -896,6 +903,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_vision_tokens: int | None = None,
         prefix_language_tokens: int | None = None,
         prefix_vision_view_tokens: list[int] | None = None,
+        language_token_masks: dict[str, Tensor] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
@@ -926,6 +934,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             state_tokens=0,
             action_tokens=self.config.chunk_size,
             vision_view_tokens=prefix_vision_view_tokens,
+            language_token_masks=language_token_masks,
         ):
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=full_att_2d_masks_4d,
@@ -1323,6 +1332,15 @@ class PI05Policy(PreTrainedPolicy):
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        language_token_masks = {}
+        if OBS_LANGUAGE_INSTRUCTION_MASK in batch:
+            language_token_masks["instruction"] = batch[OBS_LANGUAGE_INSTRUCTION_MASK].to(dtype=torch.bool)
+        if OBS_LANGUAGE_STATE_MASK in batch:
+            language_token_masks["state_text"] = batch[OBS_LANGUAGE_STATE_MASK].to(dtype=torch.bool)
+        if OBS_LANGUAGE_SCAFFOLD_MASK in batch:
+            language_token_masks["scaffold"] = batch[OBS_LANGUAGE_SCAFFOLD_MASK].to(dtype=torch.bool)
+        if language_token_masks:
+            kwargs["language_token_masks"] = language_token_masks
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)

@@ -40,6 +40,7 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_STATE,
+    PI05_LANGUAGE_CHAR_SPANS,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -64,6 +65,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
+        if isinstance(tasks, str):
+            tasks = [tasks]
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -77,13 +80,28 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
         full_prompts = []
+        language_char_spans = []
         for i, task in enumerate(tasks):
             cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
             state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            instruction_prefix = "Task: "
+            state_prefix = ", State: "
+            action_suffix = ";\nAction: "
+            instruction_start = len(instruction_prefix)
+            instruction_end = instruction_start + len(cleaned_text)
+            state_start = instruction_end + len(state_prefix)
+            state_end = state_start + len(state_str)
+            full_prompt = f"{instruction_prefix}{cleaned_text}{state_prefix}{state_str}{action_suffix}"
             full_prompts.append(full_prompt)
+            language_char_spans.append(
+                {
+                    "instruction": (instruction_start, instruction_end),
+                    "state_text": (state_start, state_end),
+                }
+            )
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
+        transition[TransitionKey.COMPLEMENTARY_DATA][PI05_LANGUAGE_CHAR_SPANS] = language_char_spans
         # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return transition

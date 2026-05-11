@@ -34,9 +34,13 @@ from lerobot.utils.constants import (
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
     OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_INSTRUCTION_MASK,
+    OBS_LANGUAGE_SCAFFOLD_MASK,
+    OBS_LANGUAGE_STATE_MASK,
     OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
     OBS_LANGUAGE_SUBTASK_TOKENS,
     OBS_LANGUAGE_TOKENS,
+    PI05_LANGUAGE_CHAR_SPANS,
 )
 from lerobot.utils.import_utils import _transformers_available
 
@@ -184,11 +188,30 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         if task is None:
             raise ValueError("Task cannot be None")
 
+        language_char_spans = self._get_language_char_spans()
+
         # Tokenize the task (this will create CPU tensors)
-        tokenized_prompt = self._tokenize_text(task)
+        tokenized_prompt = self._tokenize_text(
+            task,
+            return_offsets_mapping=language_char_spans is not None,
+        )
+        offset_mapping = tokenized_prompt.pop("offset_mapping", None)
 
         # Detect the device from existing tensors in the transition to ensure consistency
         target_device = self._detect_device(self.transition)
+
+        token_group_masks = None
+        if language_char_spans is not None:
+            if offset_mapping is None:
+                raise ValueError(
+                    "Tokenizer did not return offset_mapping, so pi0.5 instruction/state token masks "
+                    "cannot be constructed."
+                )
+            token_group_masks = self._build_language_token_group_masks(
+                offset_mapping=offset_mapping,
+                attention_mask=tokenized_prompt["attention_mask"],
+                language_char_spans=language_char_spans,
+            )
 
         # Move new tokenized tensors to the detected device
         if target_device is not None:
@@ -196,6 +219,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
                 k: v.to(target_device) if isinstance(v, torch.Tensor) else v
                 for k, v in tokenized_prompt.items()
             }
+            if token_group_masks is not None:
+                token_group_masks = {k: v.to(target_device) for k, v in token_group_masks.items()}
 
         # Create a new observation dict to avoid modifying the original in place
         new_observation = dict(observation)
@@ -203,6 +228,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         # Add tokenized data to the observation
         new_observation[OBS_LANGUAGE_TOKENS] = tokenized_prompt["input_ids"]
         new_observation[OBS_LANGUAGE_ATTENTION_MASK] = tokenized_prompt["attention_mask"].to(dtype=torch.bool)
+        if token_group_masks is not None:
+            new_observation.update(token_group_masks)
 
         # Tokenize subtask if available
         subtask = self.get_subtask(self.transition)
@@ -250,7 +277,68 @@ class TokenizerProcessorStep(ObservationProcessorStep):
 
         return None  # No tensors found, default will be CPU
 
-    def _tokenize_text(self, text: str | list[str]) -> dict[str, torch.Tensor]:
+    def _get_language_char_spans(self) -> list[dict[str, tuple[int, int]]] | None:
+        complementary_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA)
+        if complementary_data is None:
+            return None
+        spans = complementary_data.get(PI05_LANGUAGE_CHAR_SPANS)
+        if spans is None:
+            return None
+        if isinstance(spans, dict):
+            spans = [spans]
+        return spans
+
+    @staticmethod
+    def _build_language_token_group_masks(
+        *,
+        offset_mapping: torch.Tensor,
+        attention_mask: torch.Tensor,
+        language_char_spans: list[dict[str, tuple[int, int]]],
+    ) -> dict[str, torch.Tensor]:
+        batch_size, seq_len = attention_mask.shape
+        if len(language_char_spans) != batch_size:
+            if len(language_char_spans) == 1:
+                language_char_spans = language_char_spans * batch_size
+            else:
+                raise ValueError(
+                    f"Expected {batch_size} language span entries, got {len(language_char_spans)}."
+                )
+
+        instruction_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+        state_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+
+        for batch_idx, spans in enumerate(language_char_spans):
+            instruction_span = spans.get("instruction")
+            state_span = spans.get("state_text") or spans.get("state")
+            for token_idx in range(seq_len):
+                if not bool(attention_mask[batch_idx, token_idx]):
+                    continue
+                token_start, token_end = offset_mapping[batch_idx, token_idx].tolist()
+                token_start = int(token_start)
+                token_end = int(token_end)
+                if instruction_span is not None:
+                    inst_start, inst_end = instruction_span
+                    if token_start < inst_end and token_end > inst_start:
+                        instruction_mask[batch_idx, token_idx] = True
+                if state_span is not None:
+                    state_start, state_end = state_span
+                    if token_start < state_end and token_end > state_start:
+                        state_mask[batch_idx, token_idx] = True
+
+        valid_mask = attention_mask.to(dtype=torch.bool).cpu()
+        scaffold_mask = valid_mask & ~(instruction_mask | state_mask)
+        return {
+            OBS_LANGUAGE_INSTRUCTION_MASK: instruction_mask,
+            OBS_LANGUAGE_STATE_MASK: state_mask,
+            OBS_LANGUAGE_SCAFFOLD_MASK: scaffold_mask,
+        }
+
+    def _tokenize_text(
+        self,
+        text: str | list[str],
+        *,
+        return_offsets_mapping: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """
         A wrapper around the tokenizer call.
 
@@ -260,14 +348,23 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         Returns:
             A dictionary containing tokenized 'input_ids' and 'attention_mask' as PyTorch tensors.
         """
-        return self.input_tokenizer(
-            text,
-            max_length=self.max_length,
-            truncation=self.truncation,
-            padding=self.padding,
-            padding_side=self.padding_side,
-            return_tensors="pt",
-        )
+        try:
+            return self.input_tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=self.truncation,
+                padding=self.padding,
+                padding_side=self.padding_side,
+                return_offsets_mapping=return_offsets_mapping,
+                return_tensors="pt",
+            )
+        except NotImplementedError as exc:
+            if return_offsets_mapping:
+                raise ValueError(
+                    "pi0.5 instruction/state token splitting requires a fast tokenizer that supports "
+                    "offset_mapping."
+                ) from exc
+            raise
 
     def get_config(self) -> dict[str, Any]:
         """

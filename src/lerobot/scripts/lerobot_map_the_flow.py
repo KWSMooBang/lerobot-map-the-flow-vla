@@ -30,6 +30,16 @@ lerobot-map-the-flow \
     --analysis.window_size=5
 ```
 
+For pi0.5, the language prefix can be split into instruction/state text groups:
+
+```
+lerobot-map-the-flow \
+    --policy.path=lerobot/pi05_libero_finetuned_v044 \
+    --env.type=libero \
+    --env.task=libero_spatial \
+    --analysis.routes='[instruction->action,state_text->action,instruction<->state_text]'
+```
+
 For a sparse-pathway sufficiency run:
 
 ```
