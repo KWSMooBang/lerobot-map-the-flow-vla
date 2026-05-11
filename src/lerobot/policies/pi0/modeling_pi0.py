@@ -65,6 +65,12 @@ class ActionSelectKwargs(TypedDict, total=False):
     attention_knockout: AttentionKnockoutSpec | None
 
 
+def _is_paligemma_tied_embedding_key(key: str) -> bool:
+    return key.endswith("paligemma.model.language_model.embed_tokens.weight") or key.endswith(
+        "paligemma.language_model.embed_tokens.weight"
+    )
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -1090,8 +1096,28 @@ class PI0Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # Load the remapped state dict into the model. Some pi0/pi0.5 checkpoints omit
+            # PaliGemma input embeddings because they are tied to lm_head.weight.
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            tied_embedding_missing_keys = [
+                key for key in missing_keys if _is_paligemma_tied_embedding_key(key)
+            ]
+            if tied_embedding_missing_keys:
+                model._tie_paligemma_language_embedding()
+                missing_keys = [
+                    key for key in missing_keys if not _is_paligemma_tied_embedding_key(key)
+                ]
+
+            if strict and (missing_keys or unexpected_keys):
+                error_msgs = []
+                if missing_keys:
+                    error_msgs.append(f"Missing key(s) in state_dict: {missing_keys}.")
+                if unexpected_keys:
+                    error_msgs.append(f"Unexpected key(s) in state_dict: {unexpected_keys}.")
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict for {type(model).__name__}:\n\t"
+                    + "\n\t".join(error_msgs)
+                )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1114,12 +1140,35 @@ class PI0Policy(PreTrainedPolicy):
                     print(f"  ... and {len(unexpected_keys) - 5} more")
 
             if not missing_keys and not unexpected_keys:
-                print("All keys loaded successfully!")
+                if tied_embedding_missing_keys:
+                    print("All keys loaded successfully! Tied missing PaliGemma input embeddings to lm_head.")
+                else:
+                    print("All keys loaded successfully!")
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
 
         return model
+
+    def _tie_paligemma_language_embedding(self) -> None:
+        paligemma = self.model.paligemma_with_expert.paligemma
+        language_model = getattr(paligemma, "language_model", None)
+        if language_model is None:
+            language_model = paligemma.model.language_model
+        embed_tokens = getattr(language_model, "embed_tokens", None)
+        if embed_tokens is None:
+            embed_tokens = language_model.get_input_embeddings()
+        lm_head = getattr(paligemma, "lm_head", None)
+        if lm_head is None:
+            lm_head = getattr(language_model, "lm_head", None)
+        if lm_head is None:
+            raise AttributeError("Could not find PaliGemma lm_head for embedding tying.")
+        if embed_tokens.weight.shape != lm_head.weight.shape:
+            raise ValueError(
+                "Cannot tie PaliGemma input embeddings to lm_head because shapes differ: "
+                f"embed={tuple(embed_tokens.weight.shape)}, lm_head={tuple(lm_head.weight.shape)}"
+            )
+        embed_tokens.weight = lm_head.weight
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
