@@ -40,6 +40,11 @@ else:
     GemmaForCausalLM = None
     PaliGemmaForConditionalGeneration = None
 
+from lerobot.analysis.map_the_flow import (
+    AttentionKnockoutSpec,
+    attention_knockout_prefix_context,
+    attention_knockout_suffix_context,
+)
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi0.configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
@@ -57,6 +62,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    attention_knockout: AttentionKnockoutSpec | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -815,6 +821,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
+        attention_knockout: AttentionKnockoutSpec | None = kwargs.get("attention_knockout")
+
         bsize = state.shape[0]
         device = state.device
 
@@ -830,19 +838,31 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
+        prefix_vision_tokens = prefix_embs.shape[1] - lang_tokens.shape[1]
+        prefix_language_tokens = lang_tokens.shape[1]
+        prefix_vision_view_tokens = None
+        if len(images) > 0 and prefix_vision_tokens % len(images) == 0:
+            prefix_vision_view_tokens = [prefix_vision_tokens // len(images)] * len(images)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        with attention_knockout_prefix_context(
+            self.paligemma_with_expert.paligemma.language_model,
+            spec=attention_knockout,
+            vision_tokens=prefix_vision_tokens,
+            language_tokens=prefix_language_tokens,
+            vision_view_tokens=prefix_vision_view_tokens,
+        ):
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         dt = -1.0 / num_steps
 
@@ -858,6 +878,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
+                    attention_knockout=attention_knockout,
+                    prefix_vision_tokens=prefix_vision_tokens,
+                    prefix_language_tokens=prefix_language_tokens,
+                    prefix_vision_view_tokens=prefix_vision_view_tokens,
                 )
 
             if self._rtc_enabled():
@@ -890,6 +914,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        prefix_vision_tokens: int | None = None,
+        prefix_language_tokens: int | None = None,
+        prefix_vision_view_tokens: list[int] | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
@@ -908,14 +936,27 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+        if prefix_vision_tokens is None or prefix_language_tokens is None:
+            prefix_vision_tokens = prefix_len
+            prefix_language_tokens = 0
+
+        with attention_knockout_suffix_context(
+            self.paligemma_with_expert.gemma_expert.model,
+            spec=attention_knockout,
+            vision_tokens=prefix_vision_tokens,
+            language_tokens=prefix_language_tokens,
+            state_tokens=1,
+            action_tokens=self.config.chunk_size,
+            vision_view_tokens=prefix_vision_view_tokens,
+        ):
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -952,6 +993,12 @@ class PI0Policy(PreTrainedPolicy):
 
         self.model.to(config.device)
 
+        self._attention_knockout: AttentionKnockoutSpec | None = None
+        self.reset()
+
+    def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
+        """Set an inference-only attention intervention used by Map the Flow experiments."""
+        self._attention_knockout = attention_knockout
         self.reset()
 
     @classmethod
@@ -1236,7 +1283,10 @@ class PI0Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            kwargs = {}
+            if self._attention_knockout is not None:
+                kwargs["attention_knockout"] = self._attention_knockout
+            actions = self.predict_action_chunk(batch, **kwargs)[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
