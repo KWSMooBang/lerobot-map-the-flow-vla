@@ -53,6 +53,7 @@ lerobot-map-the-flow \
 """
 
 import datetime as dt
+import gc
 import json
 import logging
 import time
@@ -235,6 +236,7 @@ def _run_eval_condition(
     cfg: MapTheFlowPipelineConfig,
     *,
     policy,
+    envs,
     env_preprocessor,
     env_postprocessor,
     preprocessor,
@@ -249,29 +251,20 @@ def _run_eval_condition(
     _set_policy_knockout(policy, spec)
     policy.eval()
 
-    envs_for_condition = make_env(
-        cfg.env,
-        n_envs=cfg.eval.batch_size,
-        use_async_envs=cfg.eval.use_async_envs,
-        trust_remote_code=cfg.trust_remote_code,
-    )
     started = time.time()
-    try:
-        info = eval_policy_all(
-            envs=envs_for_condition,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=cfg.analysis.max_episodes_rendered,
-            videos_dir=Path(cfg.output_dir) / "videos" / condition_name,
-            start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
-        )
-    finally:
-        close_envs(envs_for_condition)
+    info = eval_policy_all(
+        envs=envs,
+        policy=policy,
+        env_preprocessor=env_preprocessor,
+        env_postprocessor=env_postprocessor,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        n_episodes=cfg.eval.n_episodes,
+        max_episodes_rendered=cfg.analysis.max_episodes_rendered,
+        videos_dir=Path(cfg.output_dir) / "videos" / condition_name,
+        start_seed=cfg.seed,
+        max_parallel_tasks=cfg.env.max_parallel_tasks,
+    )
 
     return {
         "condition": condition_name,
@@ -365,30 +358,45 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
         conditions.append(None)
     conditions.extend(specs)
 
+    envs = make_env(
+        cfg.env,
+        n_envs=cfg.eval.batch_size,
+        use_async_envs=cfg.eval.use_async_envs,
+        trust_remote_code=cfg.trust_remote_code,
+    )
+
     results = []
     baseline_result = None
     amp_context = torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext()
-    with torch.no_grad(), amp_context:
-        for spec in conditions:
-            result = _run_eval_condition(
-                cfg,
-                policy=policy,
-                env_preprocessor=env_preprocessor,
-                env_postprocessor=env_postprocessor,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                spec=spec,
-            )
-            if spec is None:
-                baseline_result = result
-            results.append(result)
+    try:
+        with torch.no_grad(), amp_context:
+            for spec in conditions:
+                result = _run_eval_condition(
+                    cfg,
+                    policy=policy,
+                    envs=envs,
+                    env_preprocessor=env_preprocessor,
+                    env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    spec=spec,
+                )
+                if spec is None:
+                    baseline_result = result
+                results.append(result)
 
-            summary = _summarize_delta(result, baseline_result if spec is not None else None)
-            print(json.dumps(summary, indent=2))
+                summary = _summarize_delta(result, baseline_result if spec is not None else None)
+                print(json.dumps(summary, indent=2))
 
-            payload = _build_payload(cfg, results, baseline_result, completed=False)
-            output_path = _save_payload(output_dir, payload)
-            logging.info("Saved partial Map the Flow results to %s", output_path)
+                payload = _build_payload(cfg, results, baseline_result, completed=False)
+                output_path = _save_payload(output_dir, payload)
+                logging.info("Saved partial Map the Flow results to %s", output_path)
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    finally:
+        close_envs(envs)
 
     payload = _build_payload(cfg, results, baseline_result, completed=True)
     output_path = _save_payload(output_dir, payload)
