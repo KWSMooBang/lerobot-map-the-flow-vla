@@ -65,10 +65,9 @@ from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.scripts.lerobot_eval import eval_policy_all
-from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.utils import init_logging
+from lerobot.utils.utils import get_safe_torch_device, init_logging
 
 
 @dataclass
