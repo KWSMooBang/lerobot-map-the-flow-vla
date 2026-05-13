@@ -18,6 +18,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from lerobot.analysis.map_the_flow import (
+    AttentionKnockoutSpec,
+    SpanMap,
+    apply_attention_knockout_mask,
+)
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
@@ -218,6 +223,9 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        attention_source_spans: SpanMap | None = None,
+        attention_target_spans: SpanMap | None = None,
     ) -> list[torch.Tensor]:
         query_states = []
         key_states = []
@@ -253,7 +261,13 @@ class SmolVLMWithExpertModel(nn.Module):
             _position_ids = position_ids
             _attention_mask = attention_mask
 
-        attention_mask_ = _attention_mask
+        attention_mask_ = self._apply_attention_knockout(
+            _attention_mask,
+            layer_idx,
+            attention_knockout,
+            attention_source_spans,
+            attention_target_spans,
+        )
         position_ids_ = _position_ids
 
         query_states = apply_rope(query_states, position_ids_)
@@ -295,6 +309,9 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        attention_source_spans: SpanMap | None = None,
+        attention_target_spans: SpanMap | None = None,
     ) -> list[torch.Tensor]:
         attention_interface = self.get_attention_interface()
 
@@ -308,6 +325,13 @@ class SmolVLMWithExpertModel(nn.Module):
             seq_len = inputs_embeds[0].shape[1]
             position_id, expert_position_id = position_ids[:, :seq_len], position_ids[:, seq_len:]
             prefix_attention_mask = attention_mask[:, :seq_len, :seq_len]
+            prefix_attention_mask = self._apply_attention_knockout(
+                prefix_attention_mask,
+                layer_idx,
+                attention_knockout,
+                attention_source_spans,
+                attention_target_spans,
+            )
 
             layer = model_layers[0][layer_idx]
 
@@ -380,6 +404,13 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_attention_mask = attention_mask[
                 :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
             ]  # take into account kv
+            expert_attention_mask = self._apply_attention_knockout(
+                expert_attention_mask,
+                layer_idx,
+                attention_knockout,
+                attention_source_spans,
+                attention_target_spans,
+            )
 
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
@@ -420,6 +451,9 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        attention_source_spans: SpanMap | None = None,
+        attention_target_spans: SpanMap | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -451,6 +485,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    attention_knockout=attention_knockout,
+                    attention_source_spans=attention_source_spans,
+                    attention_target_spans=attention_target_spans,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(
@@ -464,6 +501,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    attention_knockout=attention_knockout,
+                    attention_source_spans=attention_source_spans,
+                    attention_target_spans=attention_target_spans,
                 )
             outputs_embeds = []
             start = 0
@@ -508,6 +548,24 @@ class SmolVLMWithExpertModel(nn.Module):
             else:
                 outputs_embeds.append(None)
         return outputs_embeds, past_key_values
+
+    def _apply_attention_knockout(
+        self,
+        attention_mask: torch.Tensor,
+        layer_idx: int,
+        attention_knockout: AttentionKnockoutSpec | None,
+        source_spans: SpanMap | None,
+        target_spans: SpanMap | None,
+    ) -> torch.Tensor:
+        if attention_knockout is None or source_spans is None or target_spans is None:
+            return attention_mask
+        return apply_attention_knockout_mask(
+            attention_mask,
+            layer_index=layer_idx,
+            spec=attention_knockout,
+            source_spans=source_spans,
+            target_spans=target_spans,
+        )
 
     def get_attention_interface(self):
         attention_interface = self.eager_attention_forward

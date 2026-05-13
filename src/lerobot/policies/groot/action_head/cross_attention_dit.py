@@ -20,6 +20,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
+from lerobot.analysis.map_the_flow import (
+    AttentionKnockoutSpec,
+    SpanMap,
+    apply_attention_knockout_mask,
+)
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
 if TYPE_CHECKING or _diffusers_available:
@@ -40,6 +45,38 @@ else:
     SinusoidalPositionalEmbedding = None
     TimestepEmbedding = None
     Timesteps = None
+
+
+def _make_attention_knockout_bias(
+    *,
+    batch_size: int,
+    query_length: int,
+    key_length: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    layer_index: int,
+    attention_knockout: AttentionKnockoutSpec | None,
+    source_spans: SpanMap | None,
+    target_spans: SpanMap | None,
+) -> torch.Tensor | None:
+    if attention_knockout is None or source_spans is None or target_spans is None:
+        return None
+
+    mask_dtype = dtype if torch.is_floating_point(torch.empty((), dtype=dtype)) else torch.float32
+    attention_bias = torch.zeros(
+        batch_size,
+        query_length,
+        key_length,
+        dtype=mask_dtype,
+        device=device,
+    )
+    return apply_attention_knockout_mask(
+        attention_bias,
+        layer_index=layer_index,
+        spec=attention_knockout,
+        source_spans=source_spans,
+        target_spans=target_spans,
+    )
 
 
 class TimestepEncoder(nn.Module):
@@ -278,6 +315,9 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: torch.LongTensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         return_all_hidden_states: bool = False,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        encoder_source_spans: SpanMap | None = None,
+        hidden_spans: SpanMap | None = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -291,19 +331,41 @@ class DiT(ModelMixin, ConfigMixin):
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
+                attention_mask = _make_attention_knockout_bias(
+                    batch_size=hidden_states.shape[0],
+                    query_length=hidden_states.shape[1],
+                    key_length=hidden_states.shape[1],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                    layer_index=idx,
+                    attention_knockout=attention_knockout,
+                    source_spans=hidden_spans,
+                    target_spans=hidden_spans,
+                )
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=attention_mask,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
                 )
             else:
+                attention_mask = _make_attention_knockout_bias(
+                    batch_size=hidden_states.shape[0],
+                    query_length=hidden_states.shape[1],
+                    key_length=encoder_hidden_states.shape[1],
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                    layer_index=idx,
+                    attention_knockout=attention_knockout,
+                    source_spans=encoder_source_spans,
+                    target_spans=hidden_spans,
+                )
                 hidden_states = block(
                     hidden_states,
-                    attention_mask=None,
+                    attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
+                    encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
             all_hidden_states.append(hidden_states)
@@ -371,14 +433,27 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
         return_all_hidden_states: bool = False,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        token_spans: SpanMap | None = None,
     ):
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
         all_hidden_states = [hidden_states]
 
         # Process through transformer blocks
-        for _idx, block in enumerate(self.transformer_blocks):
-            hidden_states = block(hidden_states)
+        for idx, block in enumerate(self.transformer_blocks):
+            attention_mask = _make_attention_knockout_bias(
+                batch_size=hidden_states.shape[0],
+                query_length=hidden_states.shape[1],
+                key_length=hidden_states.shape[1],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+                layer_index=idx,
+                attention_knockout=attention_knockout,
+                source_spans=token_spans,
+                target_spans=token_spans,
+            )
+            hidden_states = block(hidden_states, attention_mask=attention_mask)
             all_hidden_states.append(hidden_states)
 
         if return_all_hidden_states:

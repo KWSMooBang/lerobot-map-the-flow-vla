@@ -216,7 +216,7 @@ def _set_policy_knockout(policy, spec: AttentionKnockoutSpec | None) -> None:
     else:
         raise TypeError(
             f"Policy type '{type(policy).__name__}' does not expose set_attention_knockout(). "
-            "Map the Flow VLA analysis is currently implemented for pi0 and pi05 policies."
+            "Map the Flow VLA analysis is currently implemented for pi0, pi05, smolvla, and groot policies."
         )
 
 

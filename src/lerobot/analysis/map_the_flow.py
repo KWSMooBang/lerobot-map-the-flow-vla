@@ -23,8 +23,8 @@ coarse token roles:
 
 * ``vision``: image/camera patch tokens in the PaliGemma prefix.
 * ``language``: instruction tokens in the PaliGemma prefix.
-* ``state``: proprioceptive state token in the action expert suffix (pi0 only).
-* ``action``: flow-matching action tokens in the action expert suffix.
+* ``state``: proprioceptive state tokens, either in the action suffix or in a model-specific prefix.
+* ``action``: flow-matching action tokens in the action expert/action head.
 
 The helpers below patch Hugging Face transformer attention modules at inference
 time, leaving the policy weights and normal code path untouched outside the

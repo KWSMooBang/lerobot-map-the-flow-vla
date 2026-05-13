@@ -48,6 +48,8 @@ from .action_head.flow_matching_action_head import (
 )
 from .utils import ensure_eagle_cache_ready
 
+SpanMap = dict[str, list[tuple[int, int]]]
+
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
 
@@ -138,16 +140,65 @@ class EagleBackbone(nn.Module):
         }
         del eagle_input["image_sizes"]
 
+        token_spans = self._build_token_spans(eagle_input)
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
-        return eagle_features, eagle_input["attention_mask"]
+        return eagle_features, eagle_input["attention_mask"], token_spans
+
+    def _build_token_spans(self, eagle_input: dict) -> SpanMap:
+        """Build token role spans from Eagle input ids.
+
+        Map-the-Flow evaluation normally uses batch size 1. For larger batches, we use
+        the first sample's layout because this intervention API expects one shared span map.
+        """
+
+        input_ids = eagle_input.get("input_ids")
+        attention_mask = eagle_input.get("attention_mask")
+        if input_ids is None:
+            return {}
+
+        ids = input_ids[0].detach().cpu()
+        if attention_mask is None:
+            valid = torch.ones_like(ids, dtype=torch.bool)
+        else:
+            valid = attention_mask[0].detach().cpu().bool()
+
+        image_token_id = getattr(self.eagle_model.config, "image_token_index", None)
+        if image_token_id is None:
+            return {"prefix": self._contiguous_spans(valid)}
+
+        is_image = (ids == image_token_id) & valid
+        image_spans = self._contiguous_spans(is_image)
+        language_spans = self._contiguous_spans(valid & ~is_image)
+
+        spans: SpanMap = {
+            "vision": image_spans,
+            "language": language_spans,
+            "prefix": self._contiguous_spans(valid),
+        }
+        for view_idx, span in enumerate(image_spans):
+            spans[f"view{view_idx}"] = [span]
+        return spans
+
+    def _contiguous_spans(self, mask: torch.Tensor) -> list[tuple[int, int]]:
+        spans = []
+        start = None
+        for idx, keep in enumerate(mask.tolist()):
+            if keep and start is None:
+                start = idx
+            elif not keep and start is not None:
+                spans.append((start, idx))
+                start = None
+        if start is not None:
+            spans.append((start, int(mask.numel())))
+        return spans
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask, token_spans = self.forward_eagle(vl_input)
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
@@ -161,7 +212,11 @@ class EagleBackbone(nn.Module):
             eagle_embeds = eagle_embeds + dummy_term
 
         return BatchFeature(
-            data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
+            data={
+                "backbone_features": eagle_embeds,
+                "backbone_attention_mask": eagle_mask,
+                "backbone_token_spans": token_spans,
+            }
         )  # [B, T2, hidden_size]
 
 
@@ -217,6 +272,7 @@ class GR00TN15(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        self._attention_knockout = None
         self.post_init()
 
     def validate_inputs(self, inputs):
@@ -314,6 +370,10 @@ class GR00TN15(PreTrainedModel):
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
         self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         return action_head_outputs
+
+    def set_attention_knockout(self, attention_knockout) -> None:
+        self._attention_knockout = attention_knockout
+        self.action_head.set_attention_knockout(attention_knockout)
 
     def prepare_input(self, inputs) -> tuple[BatchFeature, BatchFeature]:
         self.validate_inputs(inputs)

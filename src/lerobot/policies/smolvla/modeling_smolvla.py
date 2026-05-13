@@ -60,6 +60,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.analysis.map_the_flow import AttentionKnockoutSpec, SpanMap
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.device_utils import get_safe_dtype
 from lerobot.utils.import_utils import require_package
@@ -77,6 +78,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    attention_knockout: AttentionKnockoutSpec | None
 
 
 def create_sinusoidal_pos_embedding(
@@ -246,6 +248,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.config = config
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self._attention_knockout: AttentionKnockoutSpec | None = None
         self.reset()
 
     def reset(self):
@@ -253,6 +256,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+
+    def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
+        """Set an inference-only attention intervention used by Map the Flow experiments."""
+        self._attention_knockout = attention_knockout
+        self.reset()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -284,6 +292,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         for k in batch:
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        if self._attention_knockout is not None and "attention_knockout" not in kwargs:
+            kwargs["attention_knockout"] = self._attention_knockout
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
@@ -341,7 +352,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise)
+            if self._attention_knockout is not None:
+                kwargs["attention_knockout"] = self._attention_knockout
+            actions = self._get_action_chunk(batch, noise, **kwargs)
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -635,7 +648,13 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        return_token_counts: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -643,10 +662,12 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        view_token_counts = []
         for _img_idx, (
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
+            view_token_count = 0
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -661,6 +682,7 @@ class VLAFlowMatching(nn.Module):
                 att_masks += [0] * (image_start_mask.shape[-1])
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
+                view_token_count += image_start_mask.shape[-1]
 
             img_emb = self.vlm_with_expert.embed_image(img)
             img_emb = img_emb
@@ -674,6 +696,7 @@ class VLAFlowMatching(nn.Module):
 
             embs.append(img_emb)
             pad_masks.append(img_mask)
+            view_token_count += num_img_embs
 
             att_masks += [0] * (num_img_embs)
             if self.add_image_special_tokens:
@@ -690,6 +713,8 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+                view_token_count += image_end_mask.shape[1]
+            view_token_counts.append(view_token_count)
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -726,7 +751,49 @@ class VLAFlowMatching(nn.Module):
 
         att_masks = att_masks.expand(bsize, -1)
 
+        if return_token_counts:
+            return embs, pad_masks, att_masks, view_token_counts, num_lang_embs, states_seq_len
         return embs, pad_masks, att_masks
+
+    def _prefix_knockout_spans(
+        self,
+        view_token_counts: list[int],
+        language_tokens: int,
+        state_tokens: int,
+    ) -> SpanMap:
+        vision_tokens = sum(view_token_counts)
+        language_start = vision_tokens
+        state_start = language_start + language_tokens
+        prefix_tokens = state_start + state_tokens
+        spans: SpanMap = {
+            "vision": [(0, vision_tokens)],
+            "language": [(language_start, state_start)],
+            "prefix": [(0, prefix_tokens)],
+        }
+        if state_tokens > 0:
+            spans["state"] = [(state_start, prefix_tokens)]
+        offset = 0
+        for view_idx, view_tokens in enumerate(view_token_counts):
+            spans[f"view{view_idx}"] = [(offset, offset + view_tokens)]
+            offset += view_tokens
+        return spans
+
+    def _suffix_knockout_spans(
+        self,
+        *,
+        prefix_len: int,
+        prefix_spans: SpanMap,
+        action_tokens: int,
+    ) -> tuple[SpanMap, SpanMap]:
+        key_tokens = prefix_len + action_tokens
+        source_spans = dict(prefix_spans)
+        source_spans["suffix"] = [(prefix_len, key_tokens)]
+        source_spans["action"] = [(prefix_len, key_tokens)]
+        target_spans = {
+            "suffix": [(0, action_tokens)],
+            "action": [(0, action_tokens)],
+        }
+        return source_spans, target_spans
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -820,6 +887,7 @@ class VLAFlowMatching(nn.Module):
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        attention_knockout: AttentionKnockoutSpec | None = kwargs.get("attention_knockout")
         bsize = state.shape[0]
         device = state.device
 
@@ -827,8 +895,20 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+        (
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_view_tokens,
+            prefix_language_tokens,
+            prefix_state_tokens,
+        ) = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state, return_token_counts=True
+        )
+        prefix_spans = self._prefix_knockout_spans(
+            prefix_view_tokens,
+            prefix_language_tokens,
+            prefix_state_tokens,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -840,6 +920,9 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            attention_knockout=attention_knockout,
+            attention_source_spans=prefix_spans,
+            attention_target_spans=prefix_spans,
         )
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
@@ -855,6 +938,8 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    attention_knockout=attention_knockout,
+                    prefix_spans=prefix_spans,
                 )
 
             if self._rtc_enabled():
@@ -886,6 +971,8 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        attention_knockout: AttentionKnockoutSpec | None = None,
+        prefix_spans: SpanMap | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -901,6 +988,14 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
+        source_spans = target_spans = None
+        if prefix_spans is not None:
+            source_spans, target_spans = self._suffix_knockout_spans(
+                prefix_len=prefix_len,
+                prefix_spans=prefix_spans,
+                action_tokens=self.config.chunk_size,
+            )
+
         outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
@@ -908,6 +1003,9 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
+            attention_knockout=attention_knockout,
+            attention_source_spans=source_spans,
+            attention_target_spans=target_spans,
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]

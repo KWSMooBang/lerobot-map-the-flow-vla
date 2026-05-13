@@ -21,6 +21,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import nn
 from torch.distributions import Beta
 
+from lerobot.analysis.map_the_flow import AttentionKnockoutSpec, SpanMap
 from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
@@ -208,6 +209,7 @@ class FlowmatchingActionHead(nn.Module):
         self._beta_dist = None
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
+        self._attention_knockout: AttentionKnockoutSpec | None = None
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
@@ -258,12 +260,39 @@ class FlowmatchingActionHead(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
+        self._attention_knockout = attention_knockout
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
-        backbone_features = self.vl_self_attention(backbone_features)
+        if isinstance(self.vl_self_attention, SelfAttentionTransformer):
+            backbone_features = self.vl_self_attention(
+                backbone_features,
+                attention_knockout=self._attention_knockout,
+                token_spans=backbone_output.get("backbone_token_spans"),
+            )
+        else:
+            backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _sa_token_spans(
+        self,
+        *,
+        state_tokens: int,
+        future_tokens: int,
+        action_tokens: int,
+    ) -> SpanMap:
+        state_end = state_tokens
+        future_end = state_end + future_tokens
+        action_end = future_end + action_tokens
+        return {
+            "state": [(0, state_end)],
+            "future": [(state_end, future_end)],
+            "action": [(future_end, action_end)],
+            "suffix": [(0, action_end)],
+        }
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
@@ -273,6 +302,8 @@ class FlowmatchingActionHead(nn.Module):
 
         if self.config.expand_batch is not None:
             for k, v in backbone_output.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
                 ndim = len(v.shape)
                 factors = [self.config.expand_batch]
                 while len(factors) < ndim:
@@ -322,6 +353,11 @@ class FlowmatchingActionHead(nn.Module):
         # Join vision, language, state and action embedding along sequence dimension.
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+        sa_spans = self._sa_token_spans(
+            state_tokens=state_features.shape[1],
+            future_tokens=future_tokens.shape[1],
+            action_tokens=action_features.shape[1],
+        )
 
         vl_attn_mask = backbone_output.backbone_attention_mask
 
@@ -331,6 +367,9 @@ class FlowmatchingActionHead(nn.Module):
             encoder_attention_mask=vl_attn_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            attention_knockout=self._attention_knockout,
+            encoder_source_spans=backbone_output.get("backbone_token_spans"),
+            hidden_spans=sa_spans,
         )
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
@@ -384,12 +423,20 @@ class FlowmatchingActionHead(nn.Module):
             # Join vision, language, state and action embedding along sequence dimension.
             future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
+            sa_spans = self._sa_token_spans(
+                state_tokens=state_features.shape[1],
+                future_tokens=future_tokens.shape[1],
+                action_tokens=action_features.shape[1],
+            )
 
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
+                attention_knockout=self._attention_knockout,
+                encoder_source_spans=backbone_output.get("backbone_token_spans"),
+                hidden_spans=sa_spans,
             )
             pred = self.action_decoder(model_output, embodiment_id)
 

@@ -41,6 +41,7 @@ from typing import TypeVar
 import torch
 from torch import Tensor
 
+from lerobot.analysis.map_the_flow import AttentionKnockoutSpec
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import require_package
@@ -67,6 +68,7 @@ class GrootPolicy(PreTrainedPolicy):
 
         # Initialize GR00T model using ported components
         self._groot_model = self._create_groot_model()
+        self._attention_knockout: AttentionKnockoutSpec | None = None
 
         self.reset()
 
@@ -98,6 +100,12 @@ class GrootPolicy(PreTrainedPolicy):
     def reset(self):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+    def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
+        """Set an inference-only attention intervention used by Map the Flow experiments."""
+        self._attention_knockout = attention_knockout
+        self._groot_model.set_attention_knockout(attention_knockout)
+        self.reset()
 
     @classmethod
     def from_pretrained(
