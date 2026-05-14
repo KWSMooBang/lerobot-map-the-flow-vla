@@ -104,3 +104,71 @@ def test_cross_view_route_masks_only_other_view():
     assert torch.all(out[..., 0:2, 2:4] == 0)
     assert torch.all(out[..., 0:2, 0:2] == 0)
     assert torch.all(out[..., 2:4, 2:4] == 0)
+
+
+def test_per_sample_token_masks_apply_independently():
+    """Per-batch token masks let each sample knock out different positions."""
+
+    mask = torch.zeros(2, 1, 3, 6)  # (B=2, H=1, Q=3, K=6)
+
+    # Sample 0: vision tokens at key positions [1, 2], language at [3, 4]
+    # Sample 1: vision tokens at key positions [0, 1], language at [2, 3]
+    vision_mask = torch.tensor(
+        [
+            [False, True, True, False, False, False],
+            [True, True, False, False, False, False],
+        ]
+    )
+    language_mask = torch.tensor(
+        [
+            [False, False, False, True, True, False],
+            [False, False, True, True, False, False],
+        ]
+    )
+
+    spec = AttentionKnockoutSpec(
+        rules=(FlowRouteRule("vision", "action", ((1, 1),)),),
+        mode="block",
+    )
+    out = apply_attention_knockout_mask(
+        mask,
+        layer_index=0,
+        spec=spec,
+        source_spans={"action": [(4, 6)]},
+        target_spans={"action": [(0, 3)]},
+        source_token_masks={"vision": vision_mask, "language": language_mask},
+    )
+
+    # Sample 0: positions [1, 2] are vision keys -> blocked across all action queries
+    assert torch.all(out[0, ..., :, 1:3] < -1e20)
+    assert torch.all(out[0, ..., :, 0:1] == 0)
+    assert torch.all(out[0, ..., :, 3:6] == 0)
+
+    # Sample 1: positions [0, 1] are vision keys -> blocked across all action queries
+    assert torch.all(out[1, ..., :, 0:2] < -1e20)
+    assert torch.all(out[1, ..., :, 2:6] == 0)
+
+
+def test_token_masks_or_with_spans_for_same_group():
+    """Span and token_mask for the same group OR together to form one selector."""
+
+    mask = torch.zeros(1, 1, 2, 5)
+    # vision spans cover positions [0, 1]; token mask additionally covers position [3]
+    spec = AttentionKnockoutSpec(
+        rules=(FlowRouteRule("vision", "action", ((1, 1),)),),
+        mode="block",
+    )
+    extra_vision = torch.tensor([[False, False, False, True, False]])
+    out = apply_attention_knockout_mask(
+        mask,
+        layer_index=0,
+        spec=spec,
+        source_spans={"vision": [(0, 2)], "action": [(4, 5)]},
+        target_spans={"action": [(0, 2)]},
+        source_token_masks={"vision": extra_vision},
+    )
+
+    assert torch.all(out[..., :, 0:2] < -1e20)  # span coverage
+    assert torch.all(out[..., :, 3:4] < -1e20)  # token mask extends coverage
+    assert torch.all(out[..., :, 2:3] == 0)
+    assert torch.all(out[..., :, 4:5] == 0)

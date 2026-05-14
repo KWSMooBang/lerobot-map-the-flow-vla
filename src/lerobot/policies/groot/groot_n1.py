@@ -88,7 +88,20 @@ class EagleBackbone(nn.Module):
             print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
-        self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
+        # Eagle25VLForConditionalGeneration does not support flash_attention_2, and Map-the-Flow's
+        # knockout intervention requires eager attention to take effect anyway (FA2/SDPA fuse the
+        # mask path and ignore additive biases). Force eager up-front so construction succeeds on
+        # transformers versions that strictly validate the requested implementation.
+        config._attn_implementation = "eager"
+        if hasattr(config, "text_config"):
+            config.text_config._attn_implementation = "eager"
+        if hasattr(config, "vision_config"):
+            config.vision_config._attn_implementation = "eager"
+        self.eagle_model = AutoModel.from_config(
+            config,
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
 
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
