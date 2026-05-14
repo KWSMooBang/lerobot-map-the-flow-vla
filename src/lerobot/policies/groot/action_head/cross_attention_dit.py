@@ -56,6 +56,7 @@ def _make_attention_knockout_bias(
     device: torch.device,
     dtype: torch.dtype,
     layer_index: int,
+    layer_offset: int = 0,
     attention_knockout: AttentionKnockoutSpec | None,
     source_spans: SpanMap | None,
     target_spans: SpanMap | None,
@@ -79,7 +80,7 @@ def _make_attention_knockout_bias(
     )
     return apply_attention_knockout_mask(
         attention_bias,
-        layer_index=layer_index,
+        layer_index=layer_index + layer_offset,
         spec=attention_knockout,
         source_spans=source_spans or {},
         target_spans=target_spans or {},
@@ -451,6 +452,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         attention_knockout: AttentionKnockoutSpec | None = None,
         token_spans: SpanMap | None = None,
         token_masks: TokenMaskMap | None = None,
+        layer_offset: int = 0,
     ):
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
@@ -465,6 +467,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
                 layer_index=idx,
+                layer_offset=layer_offset,
                 attention_knockout=attention_knockout,
                 source_spans=token_spans,
                 target_spans=token_spans,

@@ -10,6 +10,7 @@ from lerobot.analysis.map_the_flow import (
     parse_route_rule,
     parse_route_rules,
 )
+from lerobot.policies.groot.action_head.cross_attention_dit import _make_attention_knockout_bias
 
 
 def test_parse_layer_ranges():
@@ -172,3 +173,42 @@ def test_token_masks_or_with_spans_for_same_group():
     assert torch.all(out[..., :, 3:4] < -1e20)  # token mask extends coverage
     assert torch.all(out[..., :, 2:3] == 0)
     assert torch.all(out[..., :, 4:5] == 0)
+
+
+def test_attention_knockout_bias_respects_layer_offset():
+    """GR00T post-VL layers can be addressed as global layers after Eagle."""
+
+    spec = AttentionKnockoutSpec(
+        rules=(FlowRouteRule("vision", "language", ((13, 13),)),),
+        mode="block",
+    )
+
+    local_layer = _make_attention_knockout_bias(
+        batch_size=1,
+        query_length=4,
+        key_length=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        layer_index=0,
+        attention_knockout=spec,
+        source_spans={"vision": [(0, 2)], "language": [(2, 4)]},
+        target_spans={"vision": [(0, 2)], "language": [(2, 4)]},
+    )
+    assert local_layer is not None
+    assert torch.all(local_layer == 0)
+
+    global_layer = _make_attention_knockout_bias(
+        batch_size=1,
+        query_length=4,
+        key_length=4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        layer_index=0,
+        layer_offset=12,
+        attention_knockout=spec,
+        source_spans={"vision": [(0, 2)], "language": [(2, 4)]},
+        target_spans={"vision": [(0, 2)], "language": [(2, 4)]},
+    )
+    assert global_layer is not None
+    assert torch.all(global_layer[..., 2:4, 0:2] < -1e20)
+    assert torch.all(global_layer[..., 0:2, :] == 0)

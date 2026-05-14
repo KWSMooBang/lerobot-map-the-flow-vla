@@ -280,12 +280,14 @@ class FlowmatchingActionHead(nn.Module):
         backbone_features = self.vlln(backbone_features)
         backbone_token_masks = backbone_output.get("backbone_token_masks")
         backbone_token_spans = {} if backbone_token_masks else backbone_output.get("backbone_token_spans")
+        vl_layer_offset = int(backbone_output.get("backbone_vl_layer_offset", 0) or 0)
         if isinstance(self.vl_self_attention, SelfAttentionTransformer):
             backbone_features = self.vl_self_attention(
                 backbone_features,
                 attention_knockout=self._active_knockout,
                 token_spans=backbone_token_spans,
                 token_masks=backbone_token_masks,
+                layer_offset=vl_layer_offset,
             )
         else:
             if self._active_knockout is not None:

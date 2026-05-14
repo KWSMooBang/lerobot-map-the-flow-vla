@@ -114,6 +114,7 @@ class EagleBackbone(nn.Module):
             self.eagle_model.language_model.model.layers.pop(-1)
 
         self.select_layer = select_layer
+        self.num_eagle_layers = len(self.eagle_model.language_model.model.layers)
         self.set_trainable_parameters(tune_llm, tune_visual)
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
@@ -324,6 +325,7 @@ class EagleBackbone(nn.Module):
                 "backbone_attention_mask": eagle_mask,
                 "backbone_token_spans": token_spans,
                 "backbone_token_masks": token_masks,
+                "backbone_vl_layer_offset": self.num_eagle_layers,
             }
         )  # [B, T2, hidden_size]
 
