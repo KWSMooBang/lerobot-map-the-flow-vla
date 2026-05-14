@@ -206,7 +206,20 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
             "Vendor files are copied during model creation. Create the policy/model first, "
             "or call ensure_eagle_cache_ready() before building processors."
         )
-    proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
+    # ``fix_mistral_regex=True`` works around an incorrect regex in older Mistral-based
+    # tokenizer.json files bundled with the Eagle processor; without it transformers warns
+    # that tokenization will be wrong. The kwarg is forwarded to the tokenizer side of the
+    # processor.
+    try:
+        proc = AutoProcessor.from_pretrained(
+            str(cache_dir),
+            trust_remote_code=True,
+            use_fast=True,
+            fix_mistral_regex=True,
+        )
+    except TypeError:
+        # Older transformers versions do not accept ``fix_mistral_regex``; fall back.
+        proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
     proc.tokenizer.padding_side = "left"
     return proc
 
