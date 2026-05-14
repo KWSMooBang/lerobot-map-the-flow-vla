@@ -23,6 +23,7 @@ from torch import nn
 from lerobot.analysis.map_the_flow import (
     AttentionKnockoutSpec,
     SpanMap,
+    TokenMaskMap,
     apply_attention_knockout_mask,
 )
 from lerobot.utils.import_utils import _diffusers_available, require_package
@@ -58,8 +59,14 @@ def _make_attention_knockout_bias(
     attention_knockout: AttentionKnockoutSpec | None,
     source_spans: SpanMap | None,
     target_spans: SpanMap | None,
+    source_token_masks: TokenMaskMap | None = None,
+    target_token_masks: TokenMaskMap | None = None,
 ) -> torch.Tensor | None:
-    if attention_knockout is None or source_spans is None or target_spans is None:
+    if attention_knockout is None:
+        return None
+    has_span = bool(source_spans) and bool(target_spans)
+    has_token_mask = bool(source_token_masks) or bool(target_token_masks)
+    if not has_span and not has_token_mask:
         return None
 
     mask_dtype = dtype if torch.is_floating_point(torch.empty((), dtype=dtype)) else torch.float32
@@ -74,8 +81,10 @@ def _make_attention_knockout_bias(
         attention_bias,
         layer_index=layer_index,
         spec=attention_knockout,
-        source_spans=source_spans,
-        target_spans=target_spans,
+        source_spans=source_spans or {},
+        target_spans=target_spans or {},
+        source_token_masks=source_token_masks,
+        target_token_masks=target_token_masks,
     )
 
 
@@ -317,7 +326,9 @@ class DiT(ModelMixin, ConfigMixin):
         return_all_hidden_states: bool = False,
         attention_knockout: AttentionKnockoutSpec | None = None,
         encoder_source_spans: SpanMap | None = None,
+        encoder_source_token_masks: TokenMaskMap | None = None,
         hidden_spans: SpanMap | None = None,
+        hidden_token_masks: TokenMaskMap | None = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -341,6 +352,8 @@ class DiT(ModelMixin, ConfigMixin):
                     attention_knockout=attention_knockout,
                     source_spans=hidden_spans,
                     target_spans=hidden_spans,
+                    source_token_masks=hidden_token_masks,
+                    target_token_masks=hidden_token_masks,
                 )
                 hidden_states = block(
                     hidden_states,
@@ -360,6 +373,8 @@ class DiT(ModelMixin, ConfigMixin):
                     attention_knockout=attention_knockout,
                     source_spans=encoder_source_spans,
                     target_spans=hidden_spans,
+                    source_token_masks=encoder_source_token_masks,
+                    target_token_masks=hidden_token_masks,
                 )
                 hidden_states = block(
                     hidden_states,
@@ -435,6 +450,7 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
         return_all_hidden_states: bool = False,
         attention_knockout: AttentionKnockoutSpec | None = None,
         token_spans: SpanMap | None = None,
+        token_masks: TokenMaskMap | None = None,
     ):
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
@@ -452,6 +468,8 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
                 attention_knockout=attention_knockout,
                 source_spans=token_spans,
                 target_spans=token_spans,
+                source_token_masks=token_masks,
+                target_token_masks=token_masks,
             )
             hidden_states = block(hidden_states, attention_mask=attention_mask)
             all_hidden_states.append(hidden_states)

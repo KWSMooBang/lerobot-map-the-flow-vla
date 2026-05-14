@@ -263,16 +263,38 @@ class FlowmatchingActionHead(nn.Module):
     def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
         self._attention_knockout = attention_knockout
 
+    @property
+    def _active_knockout(self) -> AttentionKnockoutSpec | None:
+        """Return the configured knockout spec only during inference.
+
+        Map-the-Flow is an inference-only intervention; activating it during training would
+        corrupt gradients. Guarding here protects against forgetting to clear the spec before
+        a backward pass.
+        """
+        if self.training:
+            return None
+        return self._attention_knockout
+
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
+        backbone_token_masks = backbone_output.get("backbone_token_masks")
+        backbone_token_spans = {} if backbone_token_masks else backbone_output.get("backbone_token_spans")
         if isinstance(self.vl_self_attention, SelfAttentionTransformer):
             backbone_features = self.vl_self_attention(
                 backbone_features,
-                attention_knockout=self._attention_knockout,
-                token_spans=backbone_output.get("backbone_token_spans"),
+                attention_knockout=self._active_knockout,
+                token_spans=backbone_token_spans,
+                token_masks=backbone_token_masks,
             )
         else:
+            if self._active_knockout is not None:
+                raise NotImplementedError(
+                    "Attention knockout is only implemented for SelfAttentionTransformer "
+                    f"vl_self_attention; got {type(self.vl_self_attention).__name__}. "
+                    "Either clear the spec via policy.set_attention_knockout(None) or extend "
+                    "the patch to this module type."
+                )
             backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
@@ -360,6 +382,8 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         vl_attn_mask = backbone_output.backbone_attention_mask
+        backbone_token_masks = backbone_output.get("backbone_token_masks")
+        backbone_token_spans = {} if backbone_token_masks else backbone_output.get("backbone_token_spans")
 
         model_output = self.model(
             hidden_states=sa_embs,
@@ -367,8 +391,9 @@ class FlowmatchingActionHead(nn.Module):
             encoder_attention_mask=vl_attn_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
-            attention_knockout=self._attention_knockout,
-            encoder_source_spans=backbone_output.get("backbone_token_spans"),
+            attention_knockout=self._active_knockout,
+            encoder_source_spans=backbone_token_spans,
+            encoder_source_token_masks=backbone_token_masks,
             hidden_spans=sa_spans,
         )
         pred = self.action_decoder(model_output, embodiment_id)
@@ -430,12 +455,17 @@ class FlowmatchingActionHead(nn.Module):
             )
 
             # Run model forward.
+            backbone_token_masks = backbone_output.get("backbone_token_masks")
+            backbone_token_spans = (
+                {} if backbone_token_masks else backbone_output.get("backbone_token_spans")
+            )
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
                 timestep=timesteps_tensor,
-                attention_knockout=self._attention_knockout,
-                encoder_source_spans=backbone_output.get("backbone_token_spans"),
+                attention_knockout=self._active_knockout,
+                encoder_source_spans=backbone_token_spans,
+                encoder_source_token_masks=backbone_token_masks,
                 hidden_spans=sa_spans,
             )
             pred = self.action_decoder(model_output, embodiment_id)

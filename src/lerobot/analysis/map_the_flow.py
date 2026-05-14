@@ -44,6 +44,11 @@ from torch import Tensor, nn
 LayerRange = tuple[int, int]
 Span = tuple[int, int]
 SpanMap = dict[str, list[Span]]
+# Per-batch boolean position masks, shape (batch_size, seq_len). Useful when the position of
+# a token group varies across samples (e.g., Eagle interleaves vision/language differently
+# per sample). When provided alongside ``SpanMap``, the two are OR'd together to define the
+# final selector for that group.
+TokenMaskMap = dict[str, "Tensor"]
 
 GROUP_ALIASES = {
     "image": "vision",
@@ -211,6 +216,63 @@ def _spans_for(name: str, spans: SpanMap) -> list[Span]:
     return spans.get(canonical, [])
 
 
+def _token_mask_for(name: str, token_masks: TokenMaskMap | None) -> Tensor | None:
+    if not token_masks:
+        return None
+    return token_masks.get(_canonical_group(name))
+
+
+def _selector_mask(
+    *,
+    name: str,
+    spans: SpanMap,
+    token_masks: TokenMaskMap | None,
+    length: int,
+    batch_size: int,
+    device: torch.device,
+) -> Tensor | None:
+    """Build a (batch, length) bool selector by OR'ing span ranges and per-batch token masks."""
+    selected = torch.zeros(batch_size, length, dtype=torch.bool, device=device)
+    has_selector = False
+    for start, end in _spans_for(name, spans):
+        start = max(0, min(length, start))
+        end = max(start, min(length, end))
+        if end > start:
+            selected[:, start:end] = True
+            has_selector = True
+
+    token_mask = _token_mask_for(name, token_masks)
+    if token_mask is not None:
+        token_mask = token_mask.to(device=device, dtype=torch.bool)
+        if token_mask.ndim == 1:
+            token_mask = token_mask.unsqueeze(0)
+        if token_mask.shape[0] == 1 and batch_size > 1:
+            token_mask = token_mask.expand(batch_size, -1)
+        if token_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"Token mask for group '{name}' has batch size {token_mask.shape[0]}, "
+                f"expected {batch_size}."
+            )
+        usable = min(length, token_mask.shape[1])
+        if usable > 0:
+            selected[:, :usable] |= token_mask[:, :usable]
+            has_selector = True
+
+    if not has_selector or not torch.any(selected):
+        return None
+    return selected
+
+
+def _selector_outer_mask(attention_mask: Tensor, target_mask: Tensor, source_mask: Tensor) -> Tensor:
+    """Broadcast (batch, Q) target and (batch, K) source masks to attention_mask shape."""
+    batch_size, target_length = target_mask.shape
+    source_length = source_mask.shape[1]
+    extra_dims = attention_mask.ndim - 3
+    target_shape = (batch_size, *([1] * extra_dims), target_length, 1)
+    source_shape = (batch_size, *([1] * extra_dims), 1, source_length)
+    return target_mask.reshape(target_shape) & source_mask.reshape(source_shape)
+
+
 def _restore_matching_diagonal(mask: Tensor, original: Tensor, source: Span, target: Span) -> None:
     source_start, source_end = source
     target_start, target_end = target
@@ -221,24 +283,61 @@ def _restore_matching_diagonal(mask: Tensor, original: Tensor, source: Span, tar
         ]
 
 
+def _restore_token_diagonal(mask: Tensor, original: Tensor, source_mask: Tensor, target_mask: Tensor) -> None:
+    if source_mask.shape[1] != target_mask.shape[1]:
+        return
+    diagonal = source_mask & target_mask
+    for batch_idx in range(diagonal.shape[0]):
+        positions = torch.where(diagonal[batch_idx])[0].tolist()
+        for position in positions:
+            mask[batch_idx, ..., position, position] = original[
+                batch_idx, ..., position, position
+            ]
+
+
 def _mask_route(
     mask: Tensor,
     original: Tensor,
-    source_spans: list[Span],
-    target_spans: list[Span],
     *,
+    source_spans: SpanMap,
+    target_spans: SpanMap,
+    source_token_masks: TokenMaskMap | None,
+    target_token_masks: TokenMaskMap | None,
     exclude_self: bool,
     source_name: str,
     target_name: str,
 ) -> None:
     blocked_value = _blocked_value(mask)
-    for target in target_spans:
-        target_start, target_end = target
-        for source in source_spans:
-            source_start, source_end = source
-            mask[..., target_start:target_end, source_start:source_end] = blocked_value
-            if exclude_self and _canonical_group(source_name) == _canonical_group(target_name):
-                _restore_matching_diagonal(mask, original, source, target)
+    batch_size = mask.shape[0]
+    target_length = mask.shape[-2]
+    source_length = mask.shape[-1]
+
+    source_selector = _selector_mask(
+        name=source_name,
+        spans=source_spans,
+        token_masks=source_token_masks,
+        length=source_length,
+        batch_size=batch_size,
+        device=mask.device,
+    )
+    target_selector = _selector_mask(
+        name=target_name,
+        spans=target_spans,
+        token_masks=target_token_masks,
+        length=target_length,
+        batch_size=batch_size,
+        device=mask.device,
+    )
+    if source_selector is None or target_selector is None:
+        return
+
+    mask.masked_fill_(_selector_outer_mask(mask, target_selector, source_selector), blocked_value)
+
+    if exclude_self and _canonical_group(source_name) == _canonical_group(target_name):
+        for span_source in _spans_for(source_name, source_spans):
+            for span_target in _spans_for(target_name, target_spans):
+                _restore_matching_diagonal(mask, original, span_source, span_target)
+        _restore_token_diagonal(mask, original, source_selector, target_selector)
 
 
 def apply_attention_knockout_mask(
@@ -248,8 +347,16 @@ def apply_attention_knockout_mask(
     spec: AttentionKnockoutSpec,
     source_spans: SpanMap,
     target_spans: SpanMap,
+    source_token_masks: TokenMaskMap | None = None,
+    target_token_masks: TokenMaskMap | None = None,
 ) -> Tensor:
-    """Return a copy of ``attention_mask`` with requested routes disabled."""
+    """Return a copy of ``attention_mask`` with requested routes disabled.
+
+    ``source_token_masks`` and ``target_token_masks`` provide per-batch (B, seq_len) bool
+    selectors that complement ``source_spans``/``target_spans``. They are needed when a
+    token group's position varies across samples (e.g., variable-length vision/language
+    interleaving in Eagle), where a single shared span range cannot describe all samples.
+    """
 
     active_rules = spec.rules_for_layer(layer_index)
     if spec.mode == "block" and not active_rules:
@@ -263,8 +370,10 @@ def apply_attention_knockout_mask(
             _mask_route(
                 updated,
                 original,
-                _spans_for(rule.source, source_spans),
-                _spans_for(rule.target, target_spans),
+                source_spans=source_spans,
+                target_spans=target_spans,
+                source_token_masks=source_token_masks,
+                target_token_masks=target_token_masks,
                 exclude_self=spec.exclude_self,
                 source_name=rule.source,
                 target_name=rule.target,
@@ -276,14 +385,20 @@ def apply_attention_knockout_mask(
     # explicit block rules, but using them while constructing the keep-only
     # complement would overwrite allowed primitive routes because their spans
     # overlap with view/language/action/state groups.
+    source_names_set = set(source_spans)
+    target_names_set = set(target_spans)
+    if source_token_masks:
+        source_names_set.update(_canonical_group(name) for name in source_token_masks)
+    if target_token_masks:
+        target_names_set.update(_canonical_group(name) for name in target_token_masks)
     source_aggregates = {"prefix", "suffix"}
     target_aggregates = {"prefix", "suffix"}
-    if any(name.startswith("view") for name in source_spans):
+    if any(name.startswith("view") for name in source_names_set):
         source_aggregates.add("vision")
-    if any(name.startswith("view") for name in target_spans):
+    if any(name.startswith("view") for name in target_names_set):
         target_aggregates.add("vision")
-    source_names = sorted(name for name in source_spans if name not in source_aggregates)
-    target_names = sorted(name for name in target_spans if name not in target_aggregates)
+    source_names = sorted(name for name in source_names_set if name not in source_aggregates)
+    target_names = sorted(name for name in target_names_set if name not in target_aggregates)
     for target_name in target_names:
         for source_name in source_names:
             if (source_name, target_name) in allowed:
@@ -291,8 +406,10 @@ def apply_attention_knockout_mask(
             _mask_route(
                 updated,
                 original,
-                source_spans[source_name],
-                target_spans[target_name],
+                source_spans=source_spans,
+                target_spans=target_spans,
+                source_token_masks=source_token_masks,
+                target_token_masks=target_token_masks,
                 exclude_self=spec.exclude_self,
                 source_name=source_name,
                 target_name=target_name,
@@ -340,6 +457,8 @@ def _patched_attention_layers(
     key_length: int,
     source_spans: SpanMap,
     target_spans: SpanMap,
+    source_token_masks: TokenMaskMap | None = None,
+    target_token_masks: TokenMaskMap | None = None,
 ) -> Iterator[None]:
     if spec is None:
         with nullcontext():
@@ -374,6 +493,8 @@ def _patched_attention_layers(
                         spec=spec,
                         source_spans=source_spans,
                         target_spans=target_spans,
+                        source_token_masks=source_token_masks,
+                        target_token_masks=target_token_masks,
                     )
 
                 patched_args, patched_kwargs = _replace_attention_mask(
@@ -391,6 +512,31 @@ def _patched_attention_layers(
     finally:
         for attention, original_forward in originals:
             attention.forward = original_forward
+
+
+def attention_knockout_token_context(
+    transformer: nn.Module,
+    *,
+    spec: AttentionKnockoutSpec | None,
+    query_length: int,
+    key_length: int,
+    source_spans: SpanMap | None = None,
+    target_spans: SpanMap | None = None,
+    source_token_masks: TokenMaskMap | None = None,
+    target_token_masks: TokenMaskMap | None = None,
+) -> Iterator[None]:
+    """Patch transformer attention using explicit spans and/or per-batch token masks."""
+
+    return _patched_attention_layers(
+        transformer,
+        spec=spec,
+        query_length=query_length,
+        key_length=key_length,
+        source_spans=source_spans or {},
+        target_spans=target_spans or {},
+        source_token_masks=source_token_masks,
+        target_token_masks=target_token_masks,
+    )
 
 
 def attention_knockout_prefix_context(

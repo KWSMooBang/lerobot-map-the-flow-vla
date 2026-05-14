@@ -22,6 +22,12 @@ import torch.nn as nn
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 
+from lerobot.analysis.map_the_flow import (
+    AttentionKnockoutSpec,
+    SpanMap,
+    TokenMaskMap,
+    attention_knockout_token_context,
+)
 from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
@@ -47,8 +53,6 @@ from .action_head.flow_matching_action_head import (
     FlowmatchingActionHeadConfig,
 )
 from .utils import ensure_eagle_cache_ready
-
-SpanMap = dict[str, list[tuple[int, int]]]
 
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
@@ -90,6 +94,7 @@ class EagleBackbone(nn.Module):
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
         else:
             self.eagle_linear = torch.nn.Identity()
+        self._attention_knockout: AttentionKnockoutSpec | None = None
 
         # needed since we don't use these layers. Also saves compute
         while len(self.eagle_model.language_model.model.layers) > select_layer:
@@ -133,6 +138,15 @@ class EagleBackbone(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def set_attention_knockout(self, attention_knockout: AttentionKnockoutSpec | None) -> None:
+        self._attention_knockout = attention_knockout
+
+    @property
+    def _active_knockout(self) -> AttentionKnockoutSpec | None:
+        if self.training:
+            return None
+        return self._attention_knockout
+
     def forward_eagle(self, vl_input: BatchFeature) -> BatchFeature:
         eagle_prefix = "eagle_"
         eagle_input = {
@@ -140,47 +154,127 @@ class EagleBackbone(nn.Module):
         }
         del eagle_input["image_sizes"]
 
-        token_spans = self._build_token_spans(eagle_input)
-        eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
+        token_spans, token_masks = self._build_token_layout(eagle_input)
+        seq_len = eagle_input["input_ids"].shape[1]
+        backbone_attention_mask = eagle_input["attention_mask"]
+        if self._active_knockout is not None and "attention_mask" in eagle_input:
+            eagle_input = dict(eagle_input)
+            eagle_input["attention_mask"] = self._make_causal_attention_bias(eagle_input["attention_mask"])
+            self._force_language_model_eager_attention()
+
+        token_span_fallback = {} if token_masks else token_spans
+        with attention_knockout_token_context(
+            self.eagle_model.language_model,
+            spec=self._active_knockout,
+            query_length=seq_len,
+            key_length=seq_len,
+            source_spans=token_span_fallback,
+            target_spans=token_span_fallback,
+            source_token_masks=token_masks,
+            target_token_masks=token_masks,
+        ):
+            eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
 
         eagle_features = self.eagle_linear(eagle_features)
-        return eagle_features, eagle_input["attention_mask"], token_spans
+        return eagle_features, backbone_attention_mask, token_spans, token_masks
 
-    def _build_token_spans(self, eagle_input: dict) -> SpanMap:
-        """Build token role spans from Eagle input ids.
+    def _force_language_model_eager_attention(self) -> None:
+        for module in (
+            self.eagle_model,
+            getattr(self.eagle_model, "language_model", None),
+            getattr(getattr(self.eagle_model, "language_model", None), "model", None),
+        ):
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "_attn_implementation"):
+                config._attn_implementation = "eager"
 
-        Map-the-Flow evaluation normally uses batch size 1. For larger batches, we use
-        the first sample's layout because this intervention API expects one shared span map.
+    def _make_causal_attention_bias(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        valid = attention_mask.bool()
+        batch_size, seq_len = valid.shape
+        device = attention_mask.device
+        dtype = next(self.eagle_model.language_model.parameters()).dtype
+        if dtype == torch.float16 or dtype == torch.bfloat16:
+            mask_dtype = dtype
+        else:
+            mask_dtype = torch.float32
+        positions = torch.arange(seq_len, device=device)
+        causal = positions[None, :] <= positions[:, None]
+        allowed = valid[:, None, :, None] & valid[:, None, None, :] & causal[None, None, :, :]
+        bias = torch.full(
+            (batch_size, 1, seq_len, seq_len),
+            torch.finfo(mask_dtype).min,
+            dtype=mask_dtype,
+            device=device,
+        )
+        return bias.masked_fill(allowed, 0)
+
+    def _build_token_layout(self, eagle_input: dict) -> tuple[SpanMap, TokenMaskMap]:
+        """Build token role descriptors for Map-the-Flow.
+
+        Returns a pair ``(spans, token_masks)``:
+
+        * ``spans`` is a fallback ``SpanMap`` (a single sample-0-derived layout). Useful
+          when a downstream consumer only supports spans, and as the aggregate "prefix"
+          group when batch layouts are heterogeneous.
+        * ``token_masks`` is a per-batch ``TokenMaskMap`` of shape ``(B, seq_len)`` bool
+          tensors. Each sample gets its own vision/language/view0/view1/... positions,
+          so heterogeneous batches (e.g., different prompts) get correct per-sample
+          knockout instead of sharing sample 0's layout.
         """
 
         input_ids = eagle_input.get("input_ids")
         attention_mask = eagle_input.get("attention_mask")
         if input_ids is None:
-            return {}
+            return {}, {}
 
-        ids = input_ids[0].detach().cpu()
         if attention_mask is None:
-            valid = torch.ones_like(ids, dtype=torch.bool)
+            valid_batch = torch.ones_like(input_ids, dtype=torch.bool)
         else:
-            valid = attention_mask[0].detach().cpu().bool()
+            valid_batch = attention_mask.bool()
 
         image_token_id = getattr(self.eagle_model.config, "image_token_index", None)
-        if image_token_id is None:
-            return {"prefix": self._contiguous_spans(valid)}
 
-        is_image = (ids == image_token_id) & valid
-        image_spans = self._contiguous_spans(is_image)
-        language_spans = self._contiguous_spans(valid & ~is_image)
-
-        spans: SpanMap = {
-            "vision": image_spans,
-            "language": language_spans,
-            "prefix": self._contiguous_spans(valid),
+        # Per-batch token masks (canonical group names match the analysis module).
+        token_masks: TokenMaskMap = {
+            "prefix": valid_batch.detach(),
         }
-        for view_idx, span in enumerate(image_spans):
+        if image_token_id is not None:
+            is_image_batch = (input_ids == image_token_id) & valid_batch
+            is_language_batch = valid_batch & ~is_image_batch
+            token_masks["vision"] = is_image_batch.detach()
+            token_masks["language"] = is_language_batch.detach()
+            per_sample_view_spans = [
+                self._contiguous_spans(is_image_batch[batch_idx].detach().cpu())
+                for batch_idx in range(is_image_batch.shape[0])
+            ]
+            max_views = max((len(spans) for spans in per_sample_view_spans), default=0)
+            for view_idx in range(max_views):
+                view_mask = torch.zeros_like(is_image_batch)
+                for batch_idx, sample_spans in enumerate(per_sample_view_spans):
+                    if view_idx >= len(sample_spans):
+                        continue
+                    start, end = sample_spans[view_idx]
+                    view_mask[batch_idx, start:end] = is_image_batch[batch_idx, start:end]
+                token_masks[f"view{view_idx}"] = view_mask.detach()
+
+        # Fallback spans from sample 0 (used by code paths that only consume SpanMap).
+        ids0 = input_ids[0].detach().cpu()
+        valid0 = valid_batch[0].detach().cpu()
+        if image_token_id is None:
+            spans: SpanMap = {"prefix": self._contiguous_spans(valid0)}
+            return spans, token_masks
+
+        is_image0 = (ids0 == image_token_id) & valid0
+        image_spans0 = self._contiguous_spans(is_image0)
+        spans = {
+            "vision": image_spans0,
+            "language": self._contiguous_spans(valid0 & ~is_image0),
+            "prefix": self._contiguous_spans(valid0),
+        }
+        for view_idx, span in enumerate(image_spans0):
             spans[f"view{view_idx}"] = [span]
-        return spans
+        return spans, token_masks
 
     def _contiguous_spans(self, mask: torch.Tensor) -> list[tuple[int, int]]:
         spans = []
@@ -198,7 +292,7 @@ class EagleBackbone(nn.Module):
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
 
-        eagle_embeds, eagle_mask, token_spans = self.forward_eagle(vl_input)
+        eagle_embeds, eagle_mask, token_spans, token_masks = self.forward_eagle(vl_input)
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
@@ -216,6 +310,7 @@ class EagleBackbone(nn.Module):
                 "backbone_features": eagle_embeds,
                 "backbone_attention_mask": eagle_mask,
                 "backbone_token_spans": token_spans,
+                "backbone_token_masks": token_masks,
             }
         )  # [B, T2, hidden_size]
 
@@ -373,6 +468,7 @@ class GR00TN15(PreTrainedModel):
 
     def set_attention_knockout(self, attention_knockout) -> None:
         self._attention_knockout = attention_knockout
+        self.backbone.set_attention_knockout(attention_knockout)
         self.action_head.set_attention_knockout(attention_knockout)
 
     def prepare_input(self, inputs) -> tuple[BatchFeature, BatchFeature]:
