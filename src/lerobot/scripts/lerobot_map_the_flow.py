@@ -51,7 +51,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import torch
@@ -69,6 +69,16 @@ from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import init_logging
+
+
+def _clean_choice(value: str, *, field_name: str, allowed: set[str]) -> str:
+    cleaned = str(value).strip().strip("'\"`‘’“”")
+    if cleaned not in allowed:
+        raise ValueError(
+            f"Invalid --analysis.{field_name}={value!r}. Expected one of {sorted(allowed)}. "
+            "Use plain ASCII quotes in shell commands, e.g. --analysis.metric=action_mse."
+        )
+    return cleaned
 
 
 @dataclass
@@ -96,7 +106,7 @@ class MapTheFlowAnalysisConfig:
     # A list of route@layer-range rules used as a single condition. In keep_only mode,
     # these rules are the hypothesized effective pathway retained during evaluation.
     pathways: list[str] = field(default_factory=list)
-    mode: Literal["block", "keep_only"] = "block"
+    mode: str = "block"
     include_baseline: bool = True
     max_conditions: int | None = None
     max_episodes_rendered: int = 0
@@ -111,7 +121,7 @@ class MapTheFlowAnalysisConfig:
     #                   than ``pc_success`` and a much finer signal.
     # ``both``        : compute pc_success AND action MSE for every
     #                   knockout condition (full rollout + MSE forward pass).
-    metric: Literal["pc_success", "action_mse", "both"] = "pc_success"
+    metric: str = "pc_success"
     # Cap on how many ``(obs, baseline_chunk)`` snapshots to cache during the
     # baseline rollout. With batch_size=10 each snapshot is ~1.5 MB on CPU
     # (bfloat16 image cache); the default 2000 bound is roughly 3 GB.
@@ -122,7 +132,18 @@ class MapTheFlowAnalysisConfig:
     mse_snapshot_stride: int = 1
     # Storage dtype for cached image tensors (state / tokens stay int/float32).
     # Use ``float16``/``bfloat16`` to halve memory; ``float32`` for bit-exact.
-    mse_cache_dtype: Literal["float32", "float16", "bfloat16"] = "bfloat16"
+    mse_cache_dtype: str = "bfloat16"
+
+    def __post_init__(self) -> None:
+        self.mode = _clean_choice(self.mode, field_name="mode", allowed={"block", "keep_only"})
+        self.metric = _clean_choice(
+            self.metric, field_name="metric", allowed={"pc_success", "action_mse", "both"}
+        )
+        self.mse_cache_dtype = _clean_choice(
+            self.mse_cache_dtype,
+            field_name="mse_cache_dtype",
+            allowed={"float32", "float16", "bfloat16"},
+        )
 
 
 @dataclass

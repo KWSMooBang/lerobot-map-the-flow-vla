@@ -292,6 +292,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-map-the-flow="lerobot.scripts.lerobot_map_the_flow:main"
+lerobot-attention-viz="lerobot.scripts.lerobot_attention_viz:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]
