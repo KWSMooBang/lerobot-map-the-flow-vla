@@ -68,7 +68,18 @@ METRIC_LABELS = {
     "pc_success": "success",
     "avg_sum_reward": "average reward",
     "avg_max_reward": "max reward",
+    # action-MSE metrics live under result["mse_info"] (no per-group breakdown).
+    # ``--group=overall`` is the only valid option for these.
+    "mse_mean": "mean action MSE",
+    "mse_p50": "median action MSE",
+    "mse_p95": "p95 action MSE",
+    "mse_max": "max action MSE",
 }
+
+# Metrics that come from the top-level ``result["mse_info"]`` block rather than
+# from ``result["info"]["overall"]``. They are global (one number per condition),
+# so we always treat them as ``group=overall``.
+MSE_METRICS = {"mse_mean", "mse_p50", "mse_p95", "mse_max"}
 
 PAPER_STYLE = {
     "font.family": "serif",
@@ -343,6 +354,16 @@ def _metric_from_info(info: dict, group: str, metric: str) -> tuple[float | None
     return value, n_episodes
 
 
+def _metric_from_result(result: dict, group: str, metric: str) -> tuple[float | None, int | None]:
+    """Dispatch metric extraction: pc_success/reward live under ``info``,
+    action-MSE metrics live under top-level ``mse_info``.
+    """
+    if metric in MSE_METRICS:
+        mse_info = result.get("mse_info") or {}
+        return mse_info.get(metric), mse_info.get("n_samples")
+    return _metric_from_info(result.get("info", {}), group, metric)
+
+
 def _compute_change(value: float, baseline: float, change: Literal["absolute", "relative"]) -> float:
     if change == "absolute":
         return value - baseline
@@ -420,9 +441,13 @@ def _build_group_series(
                 parsed = _parse_condition(result.get("condition", ""))
                 if parsed is None or not parsed.is_baseline:
                     continue
-                baseline, baseline_n = _metric_from_info(result.get("info", {}), group, metric)
+                baseline, baseline_n = _metric_from_result(result, group, metric)
                 break
 
+            # For action-MSE the baseline is by definition 0 (knockout vs itself);
+            # the baseline ``mse_info`` is not populated, so treat ``None`` as zero.
+            if metric in MSE_METRICS and baseline is None:
+                baseline = 0.0
             if baseline is None:
                 continue
             baselines.append(float(baseline))
@@ -433,7 +458,7 @@ def _build_group_series(
                 parsed = _parse_condition(result.get("condition", ""))
                 if parsed is None or parsed.is_baseline or parsed.route is None or parsed.center is None:
                     continue
-                value, _ = _metric_from_info(result.get("info", {}), group, metric)
+                value, _ = _metric_from_result(result, group, metric)
                 if value is None:
                     continue
                 raw_values[parsed.route][parsed.center].append(float(value))

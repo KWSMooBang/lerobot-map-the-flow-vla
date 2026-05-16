@@ -43,6 +43,7 @@ lerobot-map-the-flow \
 """
 
 import datetime as dt
+import gc
 import json
 import logging
 import time
@@ -50,8 +51,9 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Literal
+from typing import Any, Literal
 
+import numpy as np
 import torch
 from termcolor import colored
 
@@ -98,6 +100,29 @@ class MapTheFlowAnalysisConfig:
     include_baseline: bool = True
     max_conditions: int | None = None
     max_episodes_rendered: int = 0
+
+    # ── Action-MSE metric ────────────────────────────────────────────────
+    # ``pc_success``  : original behavior — full env rollouts per condition.
+    # ``action_mse``  : baseline runs full rollout while caching every
+    #                   (observation, baseline_action_chunk). Each knockout
+    #                   condition then re-runs only forward inference on
+    #                   those cached observations and reports the MSE between
+    #                   its action chunk and the baseline chunk. ~10× faster
+    #                   than ``pc_success`` and a much finer signal.
+    # ``both``        : compute pc_success AND action MSE for every
+    #                   knockout condition (full rollout + MSE forward pass).
+    metric: Literal["pc_success", "action_mse", "both"] = "pc_success"
+    # Cap on how many ``(obs, baseline_chunk)`` snapshots to cache during the
+    # baseline rollout. With batch_size=10 each snapshot is ~1.5 MB on CPU
+    # (bfloat16 image cache); the default 2000 bound is roughly 3 GB.
+    mse_max_snapshots: int = 2000
+    # Capture every ``mse_snapshot_stride``-th ``predict_action_chunk`` call.
+    # Useful when n_action_steps is small and the rollout produces more
+    # snapshots than ``mse_max_snapshots`` would allow.
+    mse_snapshot_stride: int = 1
+    # Storage dtype for cached image tensors (state / tokens stay int/float32).
+    # Use ``float16``/``bfloat16`` to halve memory; ``float32`` for bit-exact.
+    mse_cache_dtype: Literal["float32", "float16", "bfloat16"] = "bfloat16"
 
 
 @dataclass
@@ -210,6 +235,168 @@ def _make_specs(analysis_cfg: MapTheFlowAnalysisConfig) -> list[AttentionKnockou
     return specs
 
 
+_CACHE_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
+def _to_cpu_snapshot(batch: dict[str, Any], image_dtype: torch.dtype) -> dict[str, Any]:
+    """Deep-copy a policy input batch onto CPU.
+
+    Heavy floating-point tensors (assumed to be images: ndim>=4 with a spatial
+    dimension >= 64) are stored in ``image_dtype`` to save memory; everything
+    else (ids, masks, state) stays at its native dtype.
+    """
+    out: dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            is_image = v.is_floating_point() and v.ndim >= 4 and max(v.shape[-3:]) >= 64
+            target_dtype = image_dtype if is_image else v.dtype
+            out[k] = v.detach().to(device="cpu", dtype=target_dtype).clone()
+        else:
+            out[k] = v
+    return out
+
+
+class TrajectoryRecorder:
+    """Capture every ``predict_action_chunk`` call's (input batch, output chunk).
+
+    The instance is reusable: enter the context manager around the section of
+    code that runs the policy (e.g. a baseline rollout). After exit the
+    captured snapshots live in ``self.snapshots`` as a list of
+    ``(cpu_input_batch, baseline_action_chunk_cpu)`` pairs ready to feed back
+    into ``policy.predict_action_chunk`` later.
+    """
+
+    def __init__(
+        self,
+        policy,
+        *,
+        max_snapshots: int,
+        stride: int = 1,
+        image_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        self.policy = policy
+        self.max_snapshots = max_snapshots
+        self.stride = max(1, int(stride))
+        self.image_dtype = image_dtype
+        self.snapshots: list[tuple[dict[str, Any], torch.Tensor]] = []
+        self._call_idx = 0
+        self._orig_predict = None
+
+    def __enter__(self) -> "TrajectoryRecorder":
+        if not hasattr(self.policy, "predict_action_chunk"):
+            raise AttributeError(
+                f"Policy {type(self.policy).__name__} has no predict_action_chunk; "
+                "TrajectoryRecorder cannot wrap it."
+            )
+        self._orig_predict = self.policy.predict_action_chunk
+        recorder = self
+
+        @torch.no_grad()
+        def wrapped(batch, **kwargs):
+            chunk = recorder._orig_predict(batch, **kwargs)
+            should_record = (
+                recorder._call_idx % recorder.stride == 0
+                and len(recorder.snapshots) < recorder.max_snapshots
+            )
+            if should_record:
+                cpu_batch = _to_cpu_snapshot(batch, recorder.image_dtype)
+                cpu_chunk = chunk.detach().to("cpu", dtype=torch.float32).clone()
+                recorder.snapshots.append((cpu_batch, cpu_chunk))
+            recorder._call_idx += 1
+            return chunk
+
+        self.policy.predict_action_chunk = wrapped
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._orig_predict is not None:
+            self.policy.predict_action_chunk = self._orig_predict
+        self._orig_predict = None
+        return False  # propagate any exception
+
+    def cumulative_bytes(self) -> int:
+        total = 0
+        for batch, chunk in self.snapshots:
+            for v in batch.values():
+                if isinstance(v, torch.Tensor):
+                    total += v.element_size() * v.nelement()
+            total += chunk.element_size() * chunk.nelement()
+        return total
+
+
+def _move_batch_to(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
+
+
+def _run_mse_condition(
+    policy,
+    snapshots: list[tuple[dict[str, Any], torch.Tensor]],
+    spec: AttentionKnockoutSpec,
+    *,
+    device: torch.device,
+) -> dict:
+    """Forward-only evaluation: compute action MSE vs baseline on cached snapshots."""
+
+    condition_name = _condition_name(spec)
+    logging.info(colored("MSE condition:", "magenta", attrs=["bold"]) + f" {condition_name}")
+    _set_policy_knockout(policy, spec)
+    policy.eval()
+
+    per_step_acc: list[torch.Tensor] = []
+    per_dim_acc: list[torch.Tensor] = []
+    flat_per_sample: list[torch.Tensor] = []
+
+    started = time.time()
+    with torch.no_grad():
+        for batch_cpu, baseline_chunk in snapshots:
+            batch = _move_batch_to(batch_cpu, device)
+            knockout_chunk = policy.predict_action_chunk(batch)
+            knockout_chunk = knockout_chunk.detach().to("cpu", dtype=torch.float32)
+            base_chunk_f = baseline_chunk.to(dtype=torch.float32)
+
+            # Align temporal lengths if knockout chunk differs (shouldn't happen
+            # for fixed-chunk-size policies, but defensive).
+            min_t = min(knockout_chunk.shape[1], base_chunk_f.shape[1])
+            min_d = min(knockout_chunk.shape[2], base_chunk_f.shape[2])
+            ko = knockout_chunk[:, :min_t, :min_d]
+            ba = base_chunk_f[:, :min_t, :min_d]
+            sq_err = (ko - ba) ** 2  # (B, T, D)
+
+            per_step_acc.append(sq_err.mean(dim=(0, -1)))  # (T,)
+            per_dim_acc.append(sq_err.mean(dim=(0, 1)))  # (D,)
+            flat_per_sample.append(sq_err.mean(dim=(1, 2)))  # (B,)
+
+    per_step = torch.stack(per_step_acc).mean(dim=0)
+    per_dim = torch.stack(per_dim_acc).mean(dim=0)
+    flat = torch.cat(flat_per_sample)
+
+    return {
+        "condition": condition_name,
+        "elapsed_s": time.time() - started,
+        "knockout": spec.to_dict(),
+        "mse_info": {
+            "n_snapshots": len(snapshots),
+            "n_samples": int(flat.numel()),
+            "mse_mean": float(flat.mean().item()),
+            "mse_p50": float(flat.median().item()),
+            "mse_p95": float(np.percentile(flat.numpy(), 95)),
+            "mse_max": float(flat.max().item()),
+            "mse_per_step": per_step.tolist(),
+            "mse_per_dim": per_dim.tolist(),
+        },
+    }
+
+
 def _set_policy_knockout(policy, spec: AttentionKnockoutSpec | None) -> None:
     if hasattr(policy, "set_attention_knockout"):
         policy.set_attention_knockout(spec)
@@ -271,19 +458,26 @@ def _run_eval_condition(
 
 
 def _summarize_delta(result: dict, baseline: dict | None) -> dict:
-    overall = result["info"]["overall"]
-    summary = {
-        "condition": result["condition"],
-        "pc_success": overall.get("pc_success"),
-        "avg_sum_reward": overall.get("avg_sum_reward"),
-        "n_episodes": overall.get("n_episodes"),
-    }
-    if baseline is not None:
-        base_overall = baseline["info"]["overall"]
-        summary["delta_pc_success"] = overall.get("pc_success") - base_overall.get("pc_success")
-        summary["delta_avg_sum_reward"] = overall.get("avg_sum_reward") - base_overall.get(
-            "avg_sum_reward"
-        )
+    summary: dict[str, Any] = {"condition": result["condition"]}
+    info = result.get("info")
+    if info is not None:
+        overall = info["overall"]
+        summary["pc_success"] = overall.get("pc_success")
+        summary["avg_sum_reward"] = overall.get("avg_sum_reward")
+        summary["n_episodes"] = overall.get("n_episodes")
+        if baseline is not None and baseline.get("info") is not None:
+            base_overall = baseline["info"]["overall"]
+            if overall.get("pc_success") is not None and base_overall.get("pc_success") is not None:
+                summary["delta_pc_success"] = overall["pc_success"] - base_overall["pc_success"]
+            if overall.get("avg_sum_reward") is not None and base_overall.get("avg_sum_reward") is not None:
+                summary["delta_avg_sum_reward"] = (
+                    overall["avg_sum_reward"] - base_overall["avg_sum_reward"]
+                )
+    mse_info = result.get("mse_info")
+    if mse_info is not None:
+        summary["mse_mean"] = mse_info.get("mse_mean")
+        summary["mse_p95"] = mse_info.get("mse_p95")
+        summary["mse_n_samples"] = mse_info.get("n_samples")
     return summary
 
 
@@ -354,30 +548,121 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
         conditions.append(None)
     conditions.extend(specs)
 
+    metric = cfg.analysis.metric
+    if metric in {"action_mse", "both"} and not cfg.analysis.include_baseline:
+        raise ValueError(
+            f"--analysis.metric={metric} requires --analysis.include_baseline=true so the "
+            "baseline rollout can cache (observation, action) snapshots for MSE comparison."
+        )
+    logging.info(colored("Metric:", "yellow", attrs=["bold"]) + f" {metric}")
+
+    image_dtype = _CACHE_DTYPE_MAP[cfg.analysis.mse_cache_dtype]
+
     results = []
     baseline_result = None
+    mse_snapshots: list[tuple[dict[str, Any], torch.Tensor]] = []
     amp_context = torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext()
+
     with torch.no_grad(), amp_context:
         for spec in conditions:
-            result = _run_eval_condition(
-                cfg,
-                policy=policy,
-                env_preprocessor=env_preprocessor,
-                env_postprocessor=env_postprocessor,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                spec=spec,
-            )
-            if spec is None:
+            is_baseline = spec is None
+            result: dict[str, Any] = {}
+
+            if is_baseline:
+                # Baseline always uses full rollout. If MSE is requested, capture snapshots
+                # via TrajectoryRecorder so subsequent knockout conditions can replay them.
+                if metric in {"action_mse", "both"}:
+                    recorder = TrajectoryRecorder(
+                        policy,
+                        max_snapshots=cfg.analysis.mse_max_snapshots,
+                        stride=cfg.analysis.mse_snapshot_stride,
+                        image_dtype=image_dtype,
+                    )
+                    with recorder:
+                        result = _run_eval_condition(
+                            cfg,
+                            policy=policy,
+                            env_preprocessor=env_preprocessor,
+                            env_postprocessor=env_postprocessor,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            spec=None,
+                        )
+                    mse_snapshots = recorder.snapshots
+                    mb = recorder.cumulative_bytes() / (1024 * 1024)
+                    logging.info(
+                        colored("Captured", "cyan", attrs=["bold"])
+                        + f" {len(mse_snapshots)} snapshots for action-MSE ({mb:.0f} MB on CPU)"
+                    )
+                else:
+                    result = _run_eval_condition(
+                        cfg,
+                        policy=policy,
+                        env_preprocessor=env_preprocessor,
+                        env_postprocessor=env_postprocessor,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        spec=None,
+                    )
                 baseline_result = result
+            else:
+                # Knockout condition. Dispatch by metric mode.
+                if metric == "pc_success":
+                    result = _run_eval_condition(
+                        cfg,
+                        policy=policy,
+                        env_preprocessor=env_preprocessor,
+                        env_postprocessor=env_postprocessor,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        spec=spec,
+                    )
+                elif metric == "action_mse":
+                    if not mse_snapshots:
+                        raise RuntimeError(
+                            "No baseline snapshots captured; cannot compute action MSE. "
+                            "Ensure --analysis.include_baseline=true."
+                        )
+                    result = _run_mse_condition(
+                        policy, mse_snapshots, spec, device=device
+                    )
+                elif metric == "both":
+                    if not mse_snapshots:
+                        raise RuntimeError("No baseline snapshots captured for ``both`` metric.")
+                    rollout_result = _run_eval_condition(
+                        cfg,
+                        policy=policy,
+                        env_preprocessor=env_preprocessor,
+                        env_postprocessor=env_postprocessor,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        spec=spec,
+                    )
+                    # set_attention_knockout was already invoked by _run_eval_condition; re-set
+                    # here in case it was reset by intervening calls.
+                    mse_result = _run_mse_condition(
+                        policy, mse_snapshots, spec, device=device
+                    )
+                    rollout_result["mse_info"] = mse_result["mse_info"]
+                    rollout_result["mse_elapsed_s"] = mse_result["elapsed_s"]
+                    result = rollout_result
+                else:
+                    raise ValueError(f"Unknown metric: {metric}")
+
             results.append(result)
 
-            summary = _summarize_delta(result, baseline_result if spec is not None else None)
-            print(json.dumps(summary, indent=2))
+            summary = _summarize_delta(result, baseline_result if not is_baseline else None)
+            print(json.dumps(summary, indent=2, default=str))
 
             payload = _build_payload(cfg, results, baseline_result, completed=False)
             output_path = _save_payload(output_dir, payload)
             logging.info("Saved partial Map the Flow results to %s", output_path)
+
+            # Reclaim memory between conditions (esp. important for MSE mode with many
+            # snapshots queued on CPU).
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     payload = _build_payload(cfg, results, baseline_result, completed=True)
     output_path = _save_payload(output_dir, payload)
