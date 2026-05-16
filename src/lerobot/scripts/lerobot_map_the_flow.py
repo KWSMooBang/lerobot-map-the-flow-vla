@@ -268,14 +268,18 @@ def _to_cpu_snapshot(batch: dict[str, Any], image_dtype: torch.dtype) -> dict[st
 
     Heavy floating-point tensors (assumed to be images: ndim>=4 with a spatial
     dimension >= 64) are stored in ``image_dtype`` to save memory; everything
-    else (ids, masks, state) stays at its native dtype.
+    else (ids, masks, state) stays at its native dtype. Baseline rollouts call
+    the policy under ``torch.inference_mode()``, so clones must be created with
+    inference mode explicitly disabled; otherwise the replay pass may feed
+    inference tensors into compiled CUDA graphs outside inference mode.
     """
     out: dict[str, Any] = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
             is_image = v.is_floating_point() and v.ndim >= 4 and max(v.shape[-3:]) >= 64
             target_dtype = image_dtype if is_image else v.dtype
-            out[k] = v.detach().to(device="cpu", dtype=target_dtype).clone()
+            with torch.inference_mode(False):
+                out[k] = v.detach().to(device="cpu", dtype=target_dtype).clone()
         else:
             out[k] = v
     return out
@@ -325,7 +329,8 @@ class TrajectoryRecorder:
             )
             if should_record:
                 cpu_batch = _to_cpu_snapshot(batch, recorder.image_dtype)
-                cpu_chunk = chunk.detach().to("cpu", dtype=torch.float32).clone()
+                with torch.inference_mode(False):
+                    cpu_chunk = chunk.detach().to("cpu", dtype=torch.float32).clone()
                 recorder.snapshots.append((cpu_batch, cpu_chunk))
             recorder._call_idx += 1
             return chunk
@@ -353,7 +358,11 @@ def _move_batch_to(batch: dict[str, Any], device: torch.device) -> dict[str, Any
     out: dict[str, Any] = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
-            out[k] = v.to(device, non_blocking=True)
+            with torch.inference_mode(False):
+                moved = v.detach().to(device, non_blocking=True)
+                if moved.is_inference():
+                    moved = moved.clone()
+                out[k] = moved
         else:
             out[k] = v
     return out
@@ -381,21 +390,28 @@ def _run_mse_condition(
     with torch.no_grad():
         for batch_cpu, baseline_chunk in snapshots:
             batch = _move_batch_to(batch_cpu, device)
-            knockout_chunk = policy.predict_action_chunk(batch)
-            knockout_chunk = knockout_chunk.detach().to("cpu", dtype=torch.float32)
-            base_chunk_f = baseline_chunk.to(dtype=torch.float32)
+            # Match rollout-time inference semantics. This is also important for
+            # torch.compile/Inductor CUDA graphs that may have been captured
+            # during the baseline rollout under inference_mode.
+            with torch.inference_mode():
+                knockout_chunk = policy.predict_action_chunk(batch)
+            with torch.inference_mode(False):
+                knockout_chunk = knockout_chunk.detach().to("cpu", dtype=torch.float32).clone()
+                base_chunk_f = baseline_chunk.detach().to("cpu", dtype=torch.float32)
+                if base_chunk_f.is_inference():
+                    base_chunk_f = base_chunk_f.clone()
 
-            # Align temporal lengths if knockout chunk differs (shouldn't happen
-            # for fixed-chunk-size policies, but defensive).
-            min_t = min(knockout_chunk.shape[1], base_chunk_f.shape[1])
-            min_d = min(knockout_chunk.shape[2], base_chunk_f.shape[2])
-            ko = knockout_chunk[:, :min_t, :min_d]
-            ba = base_chunk_f[:, :min_t, :min_d]
-            sq_err = (ko - ba) ** 2  # (B, T, D)
+                # Align temporal lengths if knockout chunk differs (shouldn't happen
+                # for fixed-chunk-size policies, but defensive).
+                min_t = min(knockout_chunk.shape[1], base_chunk_f.shape[1])
+                min_d = min(knockout_chunk.shape[2], base_chunk_f.shape[2])
+                ko = knockout_chunk[:, :min_t, :min_d]
+                ba = base_chunk_f[:, :min_t, :min_d]
+                sq_err = (ko - ba) ** 2  # (B, T, D)
 
-            per_step_acc.append(sq_err.mean(dim=(0, -1)))  # (T,)
-            per_dim_acc.append(sq_err.mean(dim=(0, 1)))  # (D,)
-            flat_per_sample.append(sq_err.mean(dim=(1, 2)))  # (B,)
+                per_step_acc.append(sq_err.mean(dim=(0, -1)))  # (T,)
+                per_dim_acc.append(sq_err.mean(dim=(0, 1)))  # (D,)
+                flat_per_sample.append(sq_err.mean(dim=(1, 2)))  # (B,)
 
     per_step = torch.stack(per_step_acc).mean(dim=0)
     per_dim = torch.stack(per_dim_acc).mean(dim=0)
