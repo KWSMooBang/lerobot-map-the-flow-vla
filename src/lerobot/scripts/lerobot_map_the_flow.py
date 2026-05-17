@@ -63,9 +63,16 @@ from lerobot.analysis.map_the_flow import AttentionKnockoutSpec, parse_layer_ran
 from lerobot.configs import parser
 from lerobot.configs.default import EvalConfig
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
+from lerobot.envs import (
+    check_env_attributes_and_types,
+    close_envs,
+    make_env,
+    make_env_pre_post_processors,
+    preprocess_observation,
+)
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.scripts.lerobot_eval import eval_policy_all
+from lerobot.utils.constants import ACTION
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
@@ -481,6 +488,140 @@ def _set_policy_knockout(policy, spec: AttentionKnockoutSpec | None) -> None:
 import math as _math  # local alias to avoid shadowing earlier in file
 
 
+def _rollout_for_trajectory(
+    env,
+    *,
+    policy,
+    env_preprocessor,
+    env_postprocessor,
+    preprocessor,
+    postprocessor,
+    seeds: list[int] | None = None,
+    save_state: bool = True,
+) -> dict:
+    """Minimal closed-loop rollout that returns per-step action / state / reward / done.
+
+    Mirrors ``lerobot.scripts.lerobot_eval.rollout`` but:
+
+    * Skips ``return_observations=True``'s nested-observation stacking (which breaks
+      on LIBERO because the raw observation contains nested dicts like
+      ``observation.robot_state``).
+    * Optionally saves a single ``observation.state`` tensor per step (the flat
+      state produced *after* ``env_preprocessor`` runs), which is what
+      ``_compare_trajectories`` needs for state-space MSE.
+
+    Returns a dict with shape:
+
+    * ``"action"``  : (B, T, action_dim)
+    * ``"reward"``  : (B, T)
+    * ``"success"`` : (B, T)
+    * ``"done"``    : (B, T) — cumulative done flag
+    * ``"state"``   : (B, T+1, state_dim)  (present iff ``save_state``)
+    """
+    import numpy as np
+
+    if not isinstance(policy, nn.Module):
+        raise TypeError("Policy must be a PyTorch nn module.")
+
+    policy.reset()
+    observation, _info = env.reset(seed=seeds)
+    check_env_attributes_and_types(env)
+
+    all_actions: list[torch.Tensor] = []
+    all_rewards: list[torch.Tensor] = []
+    all_successes: list[torch.Tensor] = []
+    all_dones: list[torch.Tensor] = []
+    all_states: list[torch.Tensor] = []
+
+    step = 0
+    done = np.array([False] * env.num_envs)
+    max_steps = env.call("_max_episode_steps")[0]
+
+    def _attach_task(obs_dict):
+        try:
+            obs_dict["task"] = list(env.call("task_description"))
+        except (AttributeError, NotImplementedError):
+            try:
+                obs_dict["task"] = list(env.call("task"))
+            except (AttributeError, NotImplementedError):
+                obs_dict["task"] = [""] * env.num_envs
+        return obs_dict
+
+    while not np.all(done) and step < max_steps:
+        observation = preprocess_observation(observation)
+        observation = _attach_task(observation)
+        observation = env_preprocessor(observation)
+
+        if save_state and "observation.state" in observation:
+            obs_state = observation["observation.state"]
+            if isinstance(obs_state, torch.Tensor):
+                all_states.append(obs_state.detach().to("cpu", dtype=torch.float32).clone())
+
+        observation = preprocessor(observation)
+        with torch.inference_mode():
+            action = policy.select_action(observation)
+        action = postprocessor(action)
+        action_transition = env_postprocessor({ACTION: action})
+        action = action_transition[ACTION]
+
+        action_numpy = action.to("cpu").numpy()
+        if action_numpy.ndim != 2:
+            raise RuntimeError(f"Action must be (batch, action_dim); got shape {action_numpy.shape}")
+
+        observation, reward, terminated, truncated, info = env.step(action_numpy)
+
+        if "final_info" in info:
+            final_info = info["final_info"]
+            if not isinstance(final_info, dict):
+                raise RuntimeError(
+                    "Unsupported `final_info` format: expected dict (Gymnasium >= 1.0). "
+                    "Upgrade gymnasium to >= 1.0."
+                )
+            successes = final_info["is_success"].tolist()
+        elif "is_success" in info:
+            is_success = info["is_success"]
+            successes = (
+                is_success.tolist() if hasattr(is_success, "tolist") else [bool(is_success)] * env.num_envs
+            )
+        else:
+            successes = [False] * env.num_envs
+
+        done = terminated | truncated | done
+        if step + 1 == max_steps:
+            done = np.ones_like(done, dtype=bool)
+
+        all_actions.append(torch.from_numpy(action_numpy))
+        all_rewards.append(torch.from_numpy(reward))
+        all_dones.append(torch.from_numpy(done))
+        all_successes.append(torch.tensor(successes))
+        step += 1
+
+    # Capture the final state (one more entry than actions) so consumers can use it
+    # for "final-state distance" metrics.
+    if save_state:
+        observation = preprocess_observation(observation)
+        observation = _attach_task(observation)
+        observation = env_preprocessor(observation)
+        if "observation.state" in observation:
+            obs_state = observation["observation.state"]
+            if isinstance(obs_state, torch.Tensor):
+                all_states.append(obs_state.detach().to("cpu", dtype=torch.float32).clone())
+
+    ret: dict[str, torch.Tensor] = {
+        "action": torch.stack(all_actions, dim=1),
+        "reward": torch.stack(all_rewards, dim=1),
+        "success": torch.stack(all_successes, dim=1),
+        "done": torch.stack(all_dones, dim=1),
+    }
+    if save_state and all_states:
+        ret["state"] = torch.stack(all_states, dim=1)
+
+    if hasattr(policy, "use_original_modules"):
+        policy.use_original_modules()
+
+    return ret
+
+
 def _collect_trajectories(
     envs: dict,
     *,
@@ -507,8 +648,6 @@ def _collect_trajectories(
       ``eval_policy_all`` so the rest of the pipeline (summary, payload) keeps
       working unchanged.
     """
-    from lerobot.scripts.lerobot_eval import rollout
-
     per_task: dict[tuple[str, int], list[dict]] = {}
     per_group_metrics: dict[str, dict[str, list]] = defaultdict(
         lambda: {"sum_rewards": [], "max_rewards": [], "successes": []}
@@ -532,15 +671,15 @@ def _collect_trajectories(
                 else:
                     seeds = None
 
-                rollout_data = rollout(
-                    env=env,
+                rollout_data = _rollout_for_trajectory(
+                    env,
                     policy=policy,
                     env_preprocessor=env_preprocessor,
                     env_postprocessor=env_postprocessor,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                     seeds=seeds,
-                    return_observations=include_state,
+                    save_state=include_state,
                 )
 
                 actions = rollout_data["action"]  # (B, T, D)
@@ -550,14 +689,9 @@ def _collect_trajectories(
 
                 n_steps = done_tensor.shape[1]
                 done_indices = torch.argmax(done_tensor.to(int), dim=1)
-                states_tensor = None
-                if include_state and "observation" in rollout_data:
-                    obs_block = rollout_data["observation"]
-                    if isinstance(obs_block, dict):
-                        for state_key in ("observation.state", "observation.environment_state"):
-                            if state_key in obs_block:
-                                states_tensor = obs_block[state_key]
-                                break
+                # ``state`` key is present only when save_state=True AND env_preprocessor
+                # produced an ``observation.state`` tensor.
+                states_tensor = rollout_data.get("state") if include_state else None
 
                 for env_ix in range(num_envs):
                     length = int(done_indices[env_ix].item()) + 1  # include done step
