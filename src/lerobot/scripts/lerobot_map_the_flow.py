@@ -916,7 +916,6 @@ def _run_trajectory_mse_condition(
     cfg: MapTheFlowPipelineConfig,
     *,
     policy,
-    envs,
     env_preprocessor,
     env_postprocessor,
     preprocessor,
@@ -929,6 +928,11 @@ def _run_trajectory_mse_condition(
     Returns ``(result_dict, collected_trajectories)``. For the baseline call
     (``spec is None``), the trajectories must be returned and stashed by the
     caller so subsequent knockout runs can compare against them.
+
+    Envs are created **per call** (like ``_run_eval_condition``) so that LIBERO /
+    MuJoCo subprocess memory does not accumulate across many conditions. With the
+    same seeds, baseline and knockout still start from identical initial states
+    even though they live in different env subprocesses.
     """
     condition_name = _condition_name(spec)
     is_baseline = spec is None
@@ -941,19 +945,28 @@ def _run_trajectory_mse_condition(
     _set_policy_knockout(policy, spec)
     policy.eval()
 
-    started = time.time()
-    collected, info = _collect_trajectories(
-        envs,
-        policy=policy,
-        env_preprocessor=env_preprocessor,
-        env_postprocessor=env_postprocessor,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        n_episodes=cfg.eval.n_episodes,
-        start_seed=cfg.seed,
-        include_state=cfg.analysis.traj_include_state,
-        max_steps_cap=cfg.analysis.traj_max_steps,
+    envs_for_condition = make_env(
+        cfg.env,
+        n_envs=cfg.eval.batch_size,
+        use_async_envs=cfg.eval.use_async_envs,
+        trust_remote_code=cfg.trust_remote_code,
     )
+    started = time.time()
+    try:
+        collected, info = _collect_trajectories(
+            envs_for_condition,
+            policy=policy,
+            env_preprocessor=env_preprocessor,
+            env_postprocessor=env_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            n_episodes=cfg.eval.n_episodes,
+            start_seed=cfg.seed,
+            include_state=cfg.analysis.traj_include_state,
+            max_steps_cap=cfg.analysis.traj_max_steps,
+        )
+    finally:
+        close_envs(envs_for_condition)
 
     result: dict[str, Any] = {
         "condition": condition_name,
@@ -1141,17 +1154,6 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
     baseline_result = None
     mse_snapshots: list[tuple[dict[str, Any], torch.Tensor]] = []
     baseline_trajectories: dict[tuple[str, int], list[dict]] | None = None
-    # trajectory_mse needs the same envs across baseline + all knockouts (so seeds line up
-    # and we avoid the per-condition env teardown cost). All other modes keep the existing
-    # per-condition env lifecycle that _run_eval_condition manages internally.
-    shared_envs = None
-    if metric == "trajectory_mse":
-        shared_envs = make_env(
-            cfg.env,
-            n_envs=cfg.eval.batch_size,
-            use_async_envs=cfg.eval.use_async_envs,
-            trust_remote_code=cfg.trust_remote_code,
-        )
 
     amp_context = torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext()
 
@@ -1190,7 +1192,6 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
                     result, baseline_trajectories = _run_trajectory_mse_condition(
                         cfg,
                         policy=policy,
-                        envs=shared_envs,
                         env_preprocessor=env_preprocessor,
                         env_postprocessor=env_postprocessor,
                         preprocessor=preprocessor,
@@ -1238,7 +1239,6 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
                     result, _ = _run_trajectory_mse_condition(
                         cfg,
                         policy=policy,
-                        envs=shared_envs,
                         env_preprocessor=env_preprocessor,
                         env_postprocessor=env_postprocessor,
                         preprocessor=preprocessor,
@@ -1287,9 +1287,6 @@ def map_the_flow_main(cfg: MapTheFlowPipelineConfig):
     payload = _build_payload(cfg, results, baseline_result, completed=True)
     output_path = _save_payload(output_dir, payload)
     logging.info("Saved Map the Flow analysis to %s", output_path)
-
-    if shared_envs is not None:
-        close_envs(shared_envs)
 
 
 def main():
