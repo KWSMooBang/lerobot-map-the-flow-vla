@@ -68,18 +68,37 @@ METRIC_LABELS = {
     "pc_success": "success",
     "avg_sum_reward": "average reward",
     "avg_max_reward": "max reward",
-    # action-MSE metrics live under result["mse_info"] (no per-group breakdown).
-    # ``--group=overall`` is the only valid option for these.
+    # Open-loop action-MSE metrics live under result["mse_info"] (no per-group breakdown).
     "mse_mean": "mean action MSE",
     "mse_p50": "median action MSE",
     "mse_p95": "p95 action MSE",
     "mse_max": "max action MSE",
+    # Closed-loop trajectory-MSE metrics live under result["traj_mse_info"].
+    "traj_action_mse_mean": "trajectory action MSE",
+    "traj_action_mse_p95": "trajectory action MSE p95",
+    "traj_state_mse_mean": "trajectory state MSE",
+    "traj_state_mse_p95": "trajectory state MSE p95",
+    "traj_final_state_mse_mean": "final state MSE",
+    "traj_length_diff_mean": "episode length difference",
+    "traj_first_divergence_step_mean": "first divergence step",
+    "traj_pc_success_knockout": "knockout success rate",
 }
 
-# Metrics that come from the top-level ``result["mse_info"]`` block rather than
-# from ``result["info"]["overall"]``. They are global (one number per condition),
-# so we always treat them as ``group=overall``.
+# Metrics that come from the top-level ``result["mse_info"]`` block.
 MSE_METRICS = {"mse_mean", "mse_p50", "mse_p95", "mse_max"}
+
+# Metrics that come from the top-level ``result["traj_mse_info"]`` block.
+# Keys here are mapped to the corresponding field name inside traj_mse_info.
+TRAJ_MSE_METRIC_KEYS = {
+    "traj_action_mse_mean": "action_mse_mean",
+    "traj_action_mse_p95": "action_mse_p95",
+    "traj_state_mse_mean": "state_mse_mean",
+    "traj_state_mse_p95": "state_mse_p95",
+    "traj_final_state_mse_mean": "final_state_mse_mean",
+    "traj_length_diff_mean": "length_diff_mean",
+    "traj_first_divergence_step_mean": None,  # computed from list
+    "traj_pc_success_knockout": "pc_success_knockout",
+}
 
 PAPER_STYLE = {
     "font.family": "serif",
@@ -355,12 +374,26 @@ def _metric_from_info(info: dict, group: str, metric: str) -> tuple[float | None
 
 
 def _metric_from_result(result: dict, group: str, metric: str) -> tuple[float | None, int | None]:
-    """Dispatch metric extraction: pc_success/reward live under ``info``,
-    action-MSE metrics live under top-level ``mse_info``.
+    """Dispatch metric extraction across the three result blocks.
+
+    - ``pc_success`` / ``avg_*_reward``        → ``result["info"][group]``
+    - Open-loop ``mse_*``                      → ``result["mse_info"]``
+    - Closed-loop ``traj_*``                   → ``result["traj_mse_info"]``
     """
     if metric in MSE_METRICS:
         mse_info = result.get("mse_info") or {}
         return mse_info.get(metric), mse_info.get("n_samples")
+    if metric in TRAJ_MSE_METRIC_KEYS:
+        traj_info = result.get("traj_mse_info") or {}
+        n_ep = traj_info.get("n_episodes")
+        # Special case: "first divergence step" is derived from a per-episode list.
+        if metric == "traj_first_divergence_step_mean":
+            xs = traj_info.get("first_divergence_step", [])
+            if not xs:
+                return None, n_ep
+            return float(np.mean(xs)), n_ep
+        field_name = TRAJ_MSE_METRIC_KEYS[metric]
+        return traj_info.get(field_name), n_ep
     return _metric_from_info(result.get("info", {}), group, metric)
 
 
@@ -444,9 +477,12 @@ def _build_group_series(
                 baseline, baseline_n = _metric_from_result(result, group, metric)
                 break
 
-            # For action-MSE the baseline is by definition 0 (knockout vs itself);
-            # the baseline ``mse_info`` is not populated, so treat ``None`` as zero.
-            if metric in MSE_METRICS and baseline is None:
+            # For action-MSE and trajectory-MSE the baseline is by definition 0
+            # (knockout-vs-itself). The baseline ``mse_info`` / ``traj_mse_info``
+            # blocks are not populated for the baseline result so treat ``None``
+            # as zero here (but only for true MSE-like metrics).
+            mse_like = MSE_METRICS | {k for k in TRAJ_MSE_METRIC_KEYS if "mse" in k}
+            if metric in mse_like and baseline is None:
                 baseline = 0.0
             if baseline is None:
                 continue
