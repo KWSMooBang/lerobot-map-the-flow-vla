@@ -520,7 +520,7 @@ def _rollout_for_trajectory(
     """
     import numpy as np
 
-    if not isinstance(policy, nn.Module):
+    if not isinstance(policy, torch.nn.Module):
         raise TypeError("Policy must be a PyTorch nn module.")
 
     policy.reset()
