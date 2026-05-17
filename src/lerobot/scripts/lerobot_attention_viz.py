@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import tempfile
+import textwrap
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -73,6 +74,7 @@ from lerobot.scripts.lerobot_map_the_flow import (
     _condition_name,
     _clean_choice,
     _move_batch_to,
+    _predict_action_chunk_with_knockout,
     _set_policy_knockout,
 )
 from lerobot.utils.constants import (
@@ -143,6 +145,10 @@ class AttentionVizConfig:
     # (long prompts become unreadable beyond ~60 bars). Tokens past the cap
     # are silently dropped from the figure but not from the model input.
     text_bar_max_tokens: int = 60
+    # Add the decoded task instruction to image-overlay titles so the visual
+    # attention panel is interpretable without opening the text-token plot.
+    show_instruction_caption: bool = True
+    instruction_caption_max_chars: int = 180
 
     def __post_init__(self) -> None:
         self.capture_target = _clean_choice(
@@ -430,6 +436,62 @@ def _find_input_tokenizer(preprocessor):
     return None
 
 
+def _decode_instruction_text(
+    tokenizer,
+    batch: dict[str, Any],
+    *,
+    max_chars: int,
+) -> str:
+    """Decode the first sample's instruction from raw task text or language tokens."""
+    task = batch.get("task")
+    if isinstance(task, str):
+        text = task
+    elif isinstance(task, (list, tuple)) and task:
+        text = str(task[0])
+    else:
+        if tokenizer is None or OBS_LANGUAGE_TOKENS not in batch:
+            return ""
+        token_ids = batch[OBS_LANGUAGE_TOKENS]
+        if isinstance(token_ids, torch.Tensor):
+            ids = (
+                token_ids[0].detach().to("cpu").tolist()
+                if token_ids.ndim >= 2
+                else token_ids.detach().to("cpu").tolist()
+            )
+        else:
+            ids = (
+                list(token_ids[0])
+                if token_ids and isinstance(token_ids[0], (list, tuple))
+                else list(token_ids)
+            )
+
+        attention_mask = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
+        if attention_mask is not None:
+            if isinstance(attention_mask, torch.Tensor):
+                mask = (
+                    attention_mask[0].detach().to("cpu").tolist()
+                    if attention_mask.ndim >= 2
+                    else attention_mask.detach().to("cpu").tolist()
+                )
+            else:
+                mask = (
+                    list(attention_mask[0])
+                    if attention_mask and isinstance(attention_mask[0], (list, tuple))
+                    else list(attention_mask)
+                )
+            ids = [token_id for token_id, keep in zip(ids, mask, strict=False) if bool(keep)]
+
+        try:
+            text = tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        except TypeError:
+            text = tokenizer.decode(ids, skip_special_tokens=True)
+
+    text = " ".join(str(text).split())
+    if max_chars and max_chars > 0 and len(text) > max_chars:
+        text = textwrap.shorten(text, width=max_chars, placeholder="...")
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # Capture pass
 # --------------------------------------------------------------------------- #
@@ -448,7 +510,7 @@ def _capture_attention_for_snapshot(
     policy.eval()
     batch = _move_batch_to(batch_cpu, device)
     with AttentionRecorder(transformer, layer_indices) as recorder, torch.inference_mode():
-        _ = policy.predict_action_chunk(batch)
+        _ = _predict_action_chunk_with_knockout(policy, batch, spec)
     if not recorder.captured:
         raise RuntimeError(
             "AttentionRecorder did not capture anything. Make sure the chosen transformer "
@@ -480,6 +542,7 @@ def _attention_debug_payload(
     query_index: int,
     head_reduction: str,
     language_positions: list[int],
+    instruction_text: str = "",
 ) -> dict[str, Any]:
     conditions: dict[str, Any] = {}
     for cond, per_layer in attentions.items():
@@ -511,6 +574,7 @@ def _attention_debug_payload(
         conditions[cond] = layer_info
     return {
         "frame_idx": frame_idx,
+        "instruction": instruction_text,
         "layout": {
             "view_token_ranges": layout.view_token_ranges,
             "patches_per_view": layout.patches_per_view,
@@ -654,6 +718,17 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
         # Text-token attention bar chart, when feasible.
         positions: list[int] = []
         token_texts: list[str] = []
+        instruction_text = ""
+        if cfg.analysis.show_instruction_caption:
+            try:
+                instruction_text = _decode_instruction_text(
+                    tokenizer,
+                    batch_cpu,
+                    max_chars=cfg.analysis.instruction_caption_max_chars,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Failed to decode instruction caption: %s", exc)
+                instruction_text = ""
         if cfg.analysis.plot_text_bar and tokenizer is not None:
             lang_ids = batch_cpu.get(OBS_LANGUAGE_TOKENS)
             lang_mask = batch_cpu.get(OBS_LANGUAGE_ATTENTION_MASK)
@@ -682,6 +757,7 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
             query_index=cfg.analysis.query_position,
             head_reduction=cfg.analysis.head_reduction,
             language_positions=positions,
+            instruction_text=instruction_text,
         )
         debug_path = output_dir / f"attention_debug_frame{frame_idx:04d}.json"
         with open(debug_path, "w") as f:
@@ -695,6 +771,13 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
                 _short_condition_name(cond): per_layer for cond, per_layer in panel_attentions.items()
             }
             save_path = output_dir / f"attention_frame{frame_idx:04d}_{suffix}.png"
+            title = (
+                f"{cfg.policy.type if cfg.policy else 'policy'} · {cfg.env.type}/{cfg.env.task} · "
+                f"frame {frame_idx}, query pos {cfg.analysis.query_position}, "
+                f"head={cfg.analysis.head_reduction}"
+            )
+            if instruction_text:
+                title += "\nInstruction: " + textwrap.fill(instruction_text, width=110)
             fig = plot_overlay_panel(
                 images_per_view=images,
                 attentions_per_condition=display_attentions,
@@ -705,11 +788,7 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
                 layer_indices=cfg.analysis.layer_indices,
                 head_reduction=cfg.analysis.head_reduction,
                 save_path=save_path,
-                suptitle=(
-                    f"{cfg.policy.type if cfg.policy else 'policy'} · {cfg.env.type}/{cfg.env.task} · "
-                    f"frame {frame_idx}, query pos {cfg.analysis.query_position}, "
-                    f"head={cfg.analysis.head_reduction}"
-                ),
+                suptitle=title,
             )
             plt.close(fig)
             logging.info(colored("Saved", "green") + f" {save_path}")

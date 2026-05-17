@@ -44,6 +44,7 @@ lerobot-map-the-flow \
 
 import datetime as dt
 import gc
+import inspect
 import json
 import logging
 import time
@@ -431,7 +432,7 @@ def _run_mse_condition(
             # torch.compile/Inductor CUDA graphs that may have been captured
             # during the baseline rollout under inference_mode.
             with torch.inference_mode():
-                knockout_chunk = policy.predict_action_chunk(batch)
+                knockout_chunk = _predict_action_chunk_with_knockout(policy, batch, spec)
             with torch.inference_mode(False):
                 knockout_chunk = knockout_chunk.detach().to("cpu", dtype=torch.float32).clone()
                 base_chunk_f = baseline_chunk.detach().to("cpu", dtype=torch.float32)
@@ -479,6 +480,19 @@ def _set_policy_knockout(policy, spec: AttentionKnockoutSpec | None) -> None:
             f"Policy type '{type(policy).__name__}' does not expose set_attention_knockout(). "
             "Map the Flow VLA analysis is currently implemented for pi0, pi05, smolvla, and groot policies."
         )
+
+
+def _predict_action_chunk_with_knockout(policy, batch: dict[str, Any], spec: AttentionKnockoutSpec | None):
+    """Call predict_action_chunk while honoring policies that require explicit knockout kwargs."""
+    if spec is not None:
+        try:
+            params = inspect.signature(policy.predict_action_chunk).parameters
+            accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+            if accepts_kwargs or "attention_knockout" in params:
+                return policy.predict_action_chunk(batch, attention_knockout=spec)
+        except (TypeError, ValueError):
+            pass
+    return policy.predict_action_chunk(batch)
 
 
 # --------------------------------------------------------------------------- #
