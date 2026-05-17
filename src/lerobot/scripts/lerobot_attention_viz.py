@@ -40,7 +40,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from termcolor import colored
@@ -69,6 +69,7 @@ from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.scripts.lerobot_map_the_flow import (
     TrajectoryRecorder,
     _condition_name,
+    _clean_choice,
     _set_policy_knockout,
 )
 from lerobot.utils.constants import (
@@ -102,7 +103,7 @@ class AttentionVizConfig:
 
     # Which transformer to capture from: ``"action_expert"`` (default, sees
     # vision/language → action attention) or ``"vlm"`` (prefix self-attention).
-    capture_target: Literal["action_expert", "vlm"] = "action_expert"
+    capture_target: str = "action_expert"
     # Layer indices (0-indexed) to capture attention from.
     layer_indices: list[int] = field(default_factory=lambda: [2, 8, 14])
 
@@ -115,7 +116,7 @@ class AttentionVizConfig:
     # For pi05 the suffix has no state, so query 0 = first action token.
     query_position: int = 0
     # Reduction across attention heads for overlay rendering.
-    head_reduction: Literal["mean", "max", "sum"] = "mean"
+    head_reduction: str = "mean"
 
     # Number of patches per camera view (PaliGemma SigLIP defaults to 16×16=256).
     patches_per_view: tuple[int, int] = (16, 16)
@@ -133,6 +134,18 @@ class AttentionVizConfig:
     # (long prompts become unreadable beyond ~60 bars). Tokens past the cap
     # are silently dropped from the figure but not from the model input.
     text_bar_max_tokens: int = 60
+
+    def __post_init__(self) -> None:
+        self.capture_target = _clean_choice(
+            self.capture_target,
+            field_name="capture_target",
+            allowed={"action_expert", "vlm"},
+        )
+        self.head_reduction = _clean_choice(
+            self.head_reduction,
+            field_name="head_reduction",
+            allowed={"mean", "max", "sum"},
+        )
 
 
 @dataclass

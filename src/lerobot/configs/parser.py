@@ -18,10 +18,10 @@ import sys
 from argparse import ArgumentError
 from collections.abc import Callable, Iterable, Sequence
 from functools import wraps
-from pathlib import Path
 from pkgutil import ModuleInfo
+from pathlib import Path
 from types import ModuleType
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, cast, get_type_hints
 
 import draccus
 
@@ -207,7 +207,8 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
         @wraps(fn)
         def wrapper_inner(*args: Any, **kwargs: Any) -> Any:
             argspec = inspect.getfullargspec(fn)
-            argtype = argspec.annotations[argspec.args[0]]
+            type_hints = get_type_hints(fn)
+            argtype = type_hints.get(argspec.args[0], argspec.annotations[argspec.args[0]])
             if len(args) > 0 and type(args[0]) is argtype:
                 cfg = args[0]
                 args = args[1:]
