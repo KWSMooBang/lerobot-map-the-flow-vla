@@ -324,13 +324,17 @@ def _to_cpu_snapshot(batch: dict[str, Any], image_dtype: torch.dtype) -> dict[st
 
 
 class TrajectoryRecorder:
-    """Capture every ``predict_action_chunk`` call's (input batch, output chunk).
+    """Capture every action-chunk-producing call's ``(input batch, output chunk)``.
 
-    The instance is reusable: enter the context manager around the section of
-    code that runs the policy (e.g. a baseline rollout). After exit the
-    captured snapshots live in ``self.snapshots`` as a list of
-    ``(cpu_input_batch, baseline_action_chunk_cpu)`` pairs ready to feed back
-    into ``policy.predict_action_chunk`` later.
+    Policies expose the chunk-producing entry point under different names. We
+    prefer to hook ``_get_action_chunk`` when it exists (e.g. SmolVLA, where
+    ``select_action`` calls ``_get_action_chunk`` directly, bypassing
+    ``predict_action_chunk``) and fall back to ``predict_action_chunk`` for
+    policies that don't define one (e.g. pi0 / pi0.5).
+
+    ``self.snapshots`` ends up as a list of ``(cpu_input_batch, chunk_cpu)``
+    tuples. Use :attr:`hooked_method_name` so callers know which method to
+    replay through.
     """
 
     def __init__(
@@ -347,20 +351,29 @@ class TrajectoryRecorder:
         self.image_dtype = image_dtype
         self.snapshots: list[tuple[dict[str, Any], torch.Tensor]] = []
         self._call_idx = 0
-        self._orig_predict = None
+        self._orig_method = None
+        self.hooked_method_name: str | None = None
+
+    def _select_method_name(self) -> str:
+        # ``_get_action_chunk`` is the actual chunk-producing function in newer
+        # policies; ``predict_action_chunk`` wraps it but can be bypassed.
+        if hasattr(self.policy, "_get_action_chunk"):
+            return "_get_action_chunk"
+        if hasattr(self.policy, "predict_action_chunk"):
+            return "predict_action_chunk"
+        raise AttributeError(
+            f"Policy {type(self.policy).__name__} exposes neither _get_action_chunk "
+            "nor predict_action_chunk; TrajectoryRecorder cannot hook a chunk method."
+        )
 
     def __enter__(self) -> "TrajectoryRecorder":
-        if not hasattr(self.policy, "predict_action_chunk"):
-            raise AttributeError(
-                f"Policy {type(self.policy).__name__} has no predict_action_chunk; "
-                "TrajectoryRecorder cannot wrap it."
-            )
-        self._orig_predict = self.policy.predict_action_chunk
+        self.hooked_method_name = self._select_method_name()
+        self._orig_method = getattr(self.policy, self.hooked_method_name)
         recorder = self
 
         @torch.no_grad()
-        def wrapped(batch, **kwargs):
-            chunk = recorder._orig_predict(batch, **kwargs)
+        def wrapped(batch, *args, **kwargs):
+            chunk = recorder._orig_method(batch, *args, **kwargs)
             should_record = (
                 recorder._call_idx % recorder.stride == 0
                 and len(recorder.snapshots) < recorder.max_snapshots
@@ -373,13 +386,13 @@ class TrajectoryRecorder:
             recorder._call_idx += 1
             return chunk
 
-        self.policy.predict_action_chunk = wrapped
+        setattr(self.policy, self.hooked_method_name, wrapped)
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._orig_predict is not None:
-            self.policy.predict_action_chunk = self._orig_predict
-        self._orig_predict = None
+        if self._orig_method is not None and self.hooked_method_name is not None:
+            setattr(self.policy, self.hooked_method_name, self._orig_method)
+        self._orig_method = None
         return False  # propagate any exception
 
     def cumulative_bytes(self) -> int:
@@ -483,16 +496,26 @@ def _set_policy_knockout(policy, spec: AttentionKnockoutSpec | None) -> None:
 
 
 def _predict_action_chunk_with_knockout(policy, batch: dict[str, Any], spec: AttentionKnockoutSpec | None):
-    """Call predict_action_chunk while honoring policies that require explicit knockout kwargs."""
+    """Call the chunk-producing entry point while honoring per-policy quirks.
+
+    Mirrors :class:`TrajectoryRecorder`: prefers ``_get_action_chunk`` when the
+    policy exposes it (e.g. SmolVLA, whose ``select_action`` skips
+    ``predict_action_chunk``) and falls back to ``predict_action_chunk``.
+    Some policies accept ``attention_knockout`` as a kwarg on the chunk method;
+    we forward the spec when the signature allows it so the knockout is applied
+    even outside ``policy.set_attention_knockout(...)``.
+    """
+    method_name = "_get_action_chunk" if hasattr(policy, "_get_action_chunk") else "predict_action_chunk"
+    method = getattr(policy, method_name)
     if spec is not None:
         try:
-            params = inspect.signature(policy.predict_action_chunk).parameters
+            params = inspect.signature(method).parameters
             accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
             if accepts_kwargs or "attention_knockout" in params:
-                return policy.predict_action_chunk(batch, attention_knockout=spec)
+                return method(batch, attention_knockout=spec)
         except (TypeError, ValueError):
             pass
-    return policy.predict_action_chunk(batch)
+    return method(batch)
 
 
 # --------------------------------------------------------------------------- #
