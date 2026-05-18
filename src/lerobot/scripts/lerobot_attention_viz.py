@@ -121,6 +121,14 @@ class AttentionVizConfig:
     # ``[state, action_0, ..., action_{chunk-1}]`` so query 1 = first action token.
     # For pi05 the suffix has no state, so query 0 = first action token.
     query_position: int = 0
+    # Optional list of query positions to visualize. When provided, the script
+    # emits one set of overlay/text-bar PNGs *per query position* (file names get
+    # a ``_q###`` suffix). Useful for visualizing how attention evolves across
+    # the action chunk — e.g. ``[1, 25, 49]`` shows the policy's attention for
+    # the first / middle / last predicted action in the chunk. When ``None`` (or
+    # empty), the script falls back to a single position from ``query_position``
+    # so older CLI commands still work unchanged.
+    query_positions: list[int] | None = None
     # Reduction across attention heads for overlay rendering.
     head_reduction: str = "mean"
 
@@ -239,12 +247,17 @@ def _resolve_target_transformer(policy, target: str):
     """
     candidates_action_expert = [
         ("model.paligemma_with_expert.gemma_expert.model", "pi0/pi05 action expert"),
-        ("model.smolvlm_with_expert.expert", "smolvla action expert"),
+        # SmolVLA: VLAFlowMatching holds ``vlm_with_expert`` (SmolVLMWithExpertModel),
+        # which exposes ``lm_expert`` with a ``.layers`` ModuleList that the recorder
+        # can patch.
+        ("model.vlm_with_expert.lm_expert", "smolvla action expert"),
         ("model.action_head.model", "groot DiT action head"),
     ]
     candidates_vlm = [
         ("model.paligemma_with_expert.paligemma.model.language_model", "pi0/pi05 VLM"),
-        ("model.smolvlm_with_expert.smolvlm.model.text_model", "smolvla VLM"),
+        # SmolVLA: the VLM text model is at ``vlm_with_expert.vlm.model.text_model``
+        # (see ``SmolVLMWithExpertModel.get_vlm_model().text_model``).
+        ("model.vlm_with_expert.vlm.model.text_model", "smolvla VLM"),
         ("model.backbone.eagle_model.language_model", "groot Eagle VLM"),
     ]
     candidates = candidates_action_expert if target == "action_expert" else candidates_vlm
@@ -749,31 +762,35 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
                     logging.warning("Failed to decode language tokens: %s", exc)
                     positions, token_texts = [], []
 
-        debug_payload = _attention_debug_payload(
-            frame_idx=frame_idx,
-            layout=layout,
-            attentions=attentions,
-            layer_indices=cfg.analysis.layer_indices,
-            query_index=cfg.analysis.query_position,
-            head_reduction=cfg.analysis.head_reduction,
-            language_positions=positions,
-            instruction_text=instruction_text,
+        # Resolve which suffix query positions to visualize. Backward compat:
+        # if ``query_positions`` is empty/None we fall back to ``query_position``.
+        query_positions_list: list[int] = (
+            list(cfg.analysis.query_positions)
+            if cfg.analysis.query_positions
+            else [cfg.analysis.query_position]
         )
-        debug_path = output_dir / f"attention_debug_frame{frame_idx:04d}.json"
-        with open(debug_path, "w") as f:
-            json.dump(debug_payload, f, indent=2)
-        logging.info(colored("Saved", "green") + f" {debug_path}")
+        # Deduplicate while preserving order.
+        seen_q: set[int] = set()
+        query_positions_list = [q for q in query_positions_list if not (q in seen_q or seen_q.add(q))]
 
         import matplotlib.pyplot as plt
 
-        def save_panels(panel_attentions: dict[str, dict[int, torch.Tensor]], suffix: str) -> None:
+        def _query_suffix(q: int) -> str:
+            return f"q{q:03d}"
+
+        def save_panels(
+            panel_attentions: dict[str, dict[int, torch.Tensor]],
+            cond_suffix: str,
+            q_index: int,
+        ) -> None:
             display_attentions = {
                 _short_condition_name(cond): per_layer for cond, per_layer in panel_attentions.items()
             }
-            save_path = output_dir / f"attention_frame{frame_idx:04d}_{suffix}.png"
+            q_suffix = _query_suffix(q_index)
+            save_path = output_dir / f"attention_frame{frame_idx:04d}_{q_suffix}_{cond_suffix}.png"
             title = (
                 f"{cfg.policy.type if cfg.policy else 'policy'} · {cfg.env.type}/{cfg.env.task} · "
-                f"frame {frame_idx}, query pos {cfg.analysis.query_position}, "
+                f"frame {frame_idx}, query pos {q_index}, "
                 f"head={cfg.analysis.head_reduction}"
             )
             if instruction_text:
@@ -781,7 +798,7 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
             fig = plot_overlay_panel(
                 images_per_view=images,
                 attentions_per_condition=display_attentions,
-                query_index=cfg.analysis.query_position,
+                query_index=q_index,
                 view_token_ranges=layout.view_token_ranges[:n_views],
                 patches_per_view=layout.patches_per_view[:n_views],
                 view_names=view_names,
@@ -794,10 +811,12 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
             logging.info(colored("Saved", "green") + f" {save_path}")
 
             if cfg.analysis.plot_text_bar and tokenizer is not None and positions:
-                bar_save_path = output_dir / f"text_attention_frame{frame_idx:04d}_{suffix}.png"
+                bar_save_path = (
+                    output_dir / f"text_attention_frame{frame_idx:04d}_{q_suffix}_{cond_suffix}.png"
+                )
                 fig = plot_text_attention_bar(
                     attentions_per_condition=display_attentions,
-                    query_index=cfg.analysis.query_position,
+                    query_index=q_index,
                     language_token_start=layout.language_token_start,
                     valid_positions=positions,
                     token_texts=token_texts,
@@ -806,24 +825,47 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
                     save_path=bar_save_path,
                     suptitle=(
                         f"Language token attention · frame {frame_idx} · "
-                        f"query pos {cfg.analysis.query_position} · "
+                        f"query pos {q_index} · "
                         f"{len(positions)} tokens · head={cfg.analysis.head_reduction}"
                     ),
                 )
                 plt.close(fig)
                 logging.info(colored("Saved", "green") + f" {bar_save_path}")
 
-        if cfg.analysis.split_conditions and "baseline" in attentions and len(attentions) > 1:
-            for cond_name, cond_attn in attentions.items():
-                if cond_name == "baseline":
-                    continue
-                save_panels(
-                    {"baseline": attentions["baseline"], cond_name: cond_attn},
-                    _safe_filename(cond_name),
-                )
+        for q_index in query_positions_list:
+            debug_payload = _attention_debug_payload(
+                frame_idx=frame_idx,
+                layout=layout,
+                attentions=attentions,
+                layer_indices=cfg.analysis.layer_indices,
+                query_index=q_index,
+                head_reduction=cfg.analysis.head_reduction,
+                language_positions=positions,
+                instruction_text=instruction_text,
+            )
+            debug_path = (
+                output_dir / f"attention_debug_frame{frame_idx:04d}_{_query_suffix(q_index)}.json"
+            )
+            with open(debug_path, "w") as f:
+                json.dump(debug_payload, f, indent=2)
+            logging.info(colored("Saved", "green") + f" {debug_path}")
 
-        if (not cfg.analysis.split_conditions) or cfg.analysis.save_combined_panel or len(attentions) == 1:
-            save_panels(attentions, "combined")
+            if cfg.analysis.split_conditions and "baseline" in attentions and len(attentions) > 1:
+                for cond_name, cond_attn in attentions.items():
+                    if cond_name == "baseline":
+                        continue
+                    save_panels(
+                        {"baseline": attentions["baseline"], cond_name: cond_attn},
+                        _safe_filename(cond_name),
+                        q_index,
+                    )
+
+            if (
+                (not cfg.analysis.split_conditions)
+                or cfg.analysis.save_combined_panel
+                or len(attentions) == 1
+            ):
+                save_panels(attentions, "combined", q_index)
 
     # Clear knockout before exit so the policy is left in a clean state.
     _set_policy_knockout(policy, None)

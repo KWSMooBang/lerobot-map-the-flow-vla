@@ -144,7 +144,7 @@ ROUTE_PALETTE = [
     "#0072b2",
 ]
 
-POLICY_ORDER = {"pi0": 0, "pi05": 1}
+POLICY_ORDER = {"pi0": 0, "pi05": 1, "smolvla": 2, "groot": 3}
 TASK_ORDER = {
     "libero_spatial": 0,
     "libero_object": 1,
@@ -285,6 +285,10 @@ def _policy_id_from_payload(payload: dict, path: Path) -> str:
         return "pi05"
     if "pi0" in haystack:
         return "pi0"
+    if "smolvla" in haystack:
+        return "smolvla"
+    if "groot" in haystack or "gr00t" in haystack:
+        return "groot"
     return "policy"
 
 
@@ -292,6 +296,8 @@ def _policy_label(policy_id: str) -> str:
     labels = {
         "pi0": "$\\pi_0$",
         "pi05": "$\\pi_{0.5}$",
+        "smolvla": "SmolVLA",
+        "groot": "GR00T N1",
     }
     return labels.get(policy_id, policy_id)
 
