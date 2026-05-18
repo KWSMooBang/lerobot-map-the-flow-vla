@@ -133,7 +133,15 @@ class AttentionVizConfig:
     head_reduction: str = "mean"
 
     # Number of patches per camera view (PaliGemma SigLIP defaults to 16×16=256).
+    # SmolVLA's SigLIP+pixel-shuffle + image_special_tokens makes this != 256, so
+    # the script will auto-detect the per-view token count when
+    # ``vision_tokens_per_view=0`` (default) by inspecting the captured attention
+    # key dimension and the language-token count. Set this explicitly to bypass
+    # auto-detection (e.g. ``--analysis.vision_tokens_per_view=64`` to force an
+    # 8×8 grid). The auto-detection picks the largest square that fits and skips
+    # any leading/trailing special tokens.
     patches_per_view: tuple[int, int] = (16, 16)
+    vision_tokens_per_view: int = 0
     # Number of camera views the policy expects (auto-detected if 0).
     n_views: int = 0
     # Save one compact baseline-vs-condition figure per knockout condition.
@@ -334,15 +342,31 @@ def _compute_view_token_ranges(
 
 
 def _patch_grid_for_count(token_count: int, preferred: tuple[int, int]) -> tuple[int, int]:
+    """Pick the largest square grid that fits within ``token_count`` view tokens.
+
+    Many VLAs surround the SigLIP patches with image_start / image_end markers
+    (e.g. SmolVLA), so ``token_count`` is *bigger* than a perfect square. We
+    return the largest ``(s, s)`` such that ``s*s <= token_count``; the caller
+    must then slice the centered ``s*s`` block to skip the leading/trailing
+    special tokens.
+    """
     if token_count == preferred[0] * preferred[1]:
         return preferred
     side = int(round(token_count**0.5))
     if side * side == token_count:
         return (side, side)
+    floor_side = int(math.floor(token_count**0.5))
+    if floor_side * floor_side <= token_count and floor_side > 0:
+        return (floor_side, floor_side)
     raise ValueError(
-        f"Cannot reshape {token_count} view tokens into the preferred patch grid "
-        f"{preferred}; pass --analysis.patches_per_view='[H,W]' explicitly."
+        f"Cannot reshape {token_count} view tokens into any square grid; pass "
+        "--analysis.patches_per_view='[H,W]' or --analysis.vision_tokens_per_view "
+        "explicitly to override."
     )
+
+
+# ``math`` is imported lazily so the existing module-level import block stays untouched.
+import math  # noqa: E402
 
 
 def _fallback_token_layout(
@@ -363,6 +387,26 @@ def _fallback_token_layout(
     )
 
 
+def _resolve_image_preprocessor(policy):
+    """Return the function that turns a batch into (images, img_masks).
+
+    Different policies named this differently:
+
+    * pi0 / pi0.5 / groot → ``policy._preprocess_images``
+    * SmolVLA            → ``policy.prepare_images``
+    """
+    for name in ("_preprocess_images", "prepare_images"):
+        fn = getattr(policy, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _center_slice(token_count: int, sq_side: int) -> int:
+    """Offset within a per-view block where the centered (sq_side × sq_side) slice begins."""
+    return max(0, (token_count - sq_side * sq_side) // 2)
+
+
 def _infer_token_layout(
     policy,
     batch_cpu: dict[str, Any],
@@ -371,24 +415,33 @@ def _infer_token_layout(
     image_keys: list[str],
     requested_n_views: int,
     preferred_patches_per_view: tuple[int, int],
+    override_vision_tokens_per_view: int = 0,
 ) -> AttentionTokenLayout:
-    """Infer view/language key offsets from the policy's real prefix embedding path."""
+    """Infer view/language key offsets from the policy's real prefix embedding path.
+
+    When the policy surrounds each view's SigLIP patches with image_start /
+    image_end markers (SmolVLA), the per-view block is not a perfect square.
+    We auto-detect by reading ``view_token_counts`` from ``embed_prefix`` and
+    pick the largest square that fits, centered within the per-view range so
+    leading/trailing special tokens are skipped.
+    """
     n_views = requested_n_views or len(image_keys)
     fallback = _fallback_token_layout(
         image_keys=image_keys,
         n_views=n_views,
         patches_per_view=preferred_patches_per_view,
     )
-    if not hasattr(policy, "_preprocess_images") or not hasattr(getattr(policy, "model", None), "embed_prefix"):
+    preprocess_images = _resolve_image_preprocessor(policy)
+    embed_prefix = getattr(getattr(policy, "model", None), "embed_prefix", None)
+    if preprocess_images is None or embed_prefix is None:
         return fallback
 
     try:
         batch = _move_batch_to(batch_cpu, device)
         with torch.inference_mode():
-            images, img_masks = policy._preprocess_images(batch)  # noqa: SLF001
+            images, img_masks = preprocess_images(batch)
             lang_tokens = batch[OBS_LANGUAGE_TOKENS]
             lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
-            embed_prefix = policy.model.embed_prefix
 
             try:
                 prefix_result = embed_prefix(
@@ -413,12 +466,22 @@ def _infer_token_layout(
 
         if requested_n_views:
             view_token_counts = view_token_counts[:requested_n_views]
+
+        # Apply user override if provided.
+        if override_vision_tokens_per_view > 0:
+            view_token_counts = [override_vision_tokens_per_view] * len(view_token_counts)
+
         offset = 0
         view_token_ranges: list[tuple[int, int]] = []
         patch_grids: list[tuple[int, int]] = []
         for token_count in view_token_counts:
-            view_token_ranges.append((offset, offset + token_count))
-            patch_grids.append(_patch_grid_for_count(token_count, preferred_patches_per_view))
+            grid = _patch_grid_for_count(token_count, preferred_patches_per_view)
+            sq = grid[0] * grid[1]
+            # Center the square slice within the view's token range so leading
+            # image_start / trailing image_end markers (if any) are skipped.
+            inner_start = offset + _center_slice(token_count, grid[0])
+            view_token_ranges.append((inner_start, inner_start + sq))
+            patch_grids.append(grid)
             offset += token_count
 
         return AttentionTokenLayout(
@@ -712,6 +775,7 @@ def attention_viz_main(cfg: AttentionVizPipelineConfig):
             image_keys=image_keys,
             requested_n_views=cfg.analysis.n_views,
             preferred_patches_per_view=cfg.analysis.patches_per_view,
+            override_vision_tokens_per_view=cfg.analysis.vision_tokens_per_view,
         )
         images = _extract_view_images(batch_cpu, layout.image_keys)
         n_views = len(images)
