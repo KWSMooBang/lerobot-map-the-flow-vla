@@ -57,7 +57,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from lerobot import envs, policies  # noqa: F401
-from lerobot.analysis.attention_capture import AttentionRecorder
+from lerobot.analysis.attention_capture import AttentionRecorder, make_attention_recorder
 from lerobot.analysis.attention_overlay import (
     decode_language_tokens,
     plot_overlay_panel,
@@ -518,16 +518,26 @@ def _capture_attention_for_snapshot(
     layer_indices: list[int],
     spec: AttentionKnockoutSpec | None,
 ) -> dict[int, torch.Tensor]:
-    """Run a single forward pass with knockout spec and capture attention probs."""
+    """Run a single forward pass with knockout spec and capture attention probs.
+
+    Dispatches between :class:`AttentionRecorder` (default — patches each layer's
+    ``self_attn.forward`` and asks for ``output_attentions=True``) and
+    :class:`SmolVLAAttentionRecorder` (SmolVLA's bespoke attention bypasses
+    ``self_attn.forward``, so we patch the parent ``SmolVLMWithExpertModel``
+    methods that actually compute the softmax).
+    """
     _set_policy_knockout(policy, spec)
     policy.eval()
     batch = _move_batch_to(batch_cpu, device)
-    with AttentionRecorder(transformer, layer_indices) as recorder, torch.inference_mode():
+    recorder = make_attention_recorder(policy, transformer, layer_indices)
+    with recorder, torch.inference_mode():
         _ = _predict_action_chunk_with_knockout(policy, batch, spec)
     if not recorder.captured:
         raise RuntimeError(
-            "AttentionRecorder did not capture anything. Make sure the chosen transformer "
-            "uses ``_attn_implementation='eager'`` and that ``layer_indices`` are within range."
+            "Attention recorder did not capture anything. Make sure the chosen transformer "
+            "uses ``_attn_implementation='eager'`` (default for pi0/pi0.5 inference) and "
+            "that ``layer_indices`` are within range. For SmolVLA the patch targets "
+            "``model.vlm_with_expert`` — confirm that attribute is reachable."
         )
     return recorder.captured
 
