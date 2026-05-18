@@ -442,6 +442,15 @@ def _infer_token_layout(
             images, img_masks = preprocess_images(batch)
             lang_tokens = batch[OBS_LANGUAGE_TOKENS]
             lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+            # Some policies (SmolVLA, pi0) project state through a Linear whose
+            # in_features == max_state_dim, so the raw state vector needs padding
+            # via ``policy.prepare_state``. Falling back to ``batch[OBS_STATE]``
+            # works for policies that take an already-padded state.
+            prepare_state = getattr(policy, "prepare_state", None)
+            if callable(prepare_state):
+                state_tensor = prepare_state(batch)
+            else:
+                state_tensor = batch.get(OBS_STATE)
 
             try:
                 prefix_result = embed_prefix(
@@ -449,7 +458,7 @@ def _infer_token_layout(
                     img_masks,
                     lang_tokens,
                     lang_masks,
-                    state=batch.get(OBS_STATE),
+                    state=state_tensor,
                     return_token_counts=True,
                 )
                 view_token_counts = [int(x) for x in prefix_result[3]]
